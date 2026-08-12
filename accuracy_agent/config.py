@@ -33,6 +33,11 @@ class DebugConfig:
     xpu_ssh_key_path: Optional[str] = None
 
     # Test scope
+    # layer_select: "auto" (default) tests one representative per UNIQUE layer
+    # type the model has (see model_loader.layer_groups) -- e.g. a dense and a
+    # MoE layer for GLM-MoE. "range" tests the explicit [layer_start, layer_end)
+    # sweep instead (manual override).
+    layer_select: str = "auto"
     layer_start: int = 0
     layer_end: int = 3
     test_prompt: str = "What is the capital of France?"
@@ -69,6 +74,7 @@ class DebugConfig:
             "shared_fs": data.get("shared_fs", "/mnt/weka"),
             "output_dir": data.get("output_dir", "/mnt/weka/accuracy_debug"),
 
+            "layer_select": data.get("test", {}).get("select", "auto"),
             "layer_start": data.get("test", {}).get("layer_start", 0),
             "layer_end": data.get("test", {}).get("layer_end", 3),
             "test_prompt": data.get("test", {}).get("prompt", "What is the capital of France?"),

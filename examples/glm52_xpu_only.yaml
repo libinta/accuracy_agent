@@ -8,7 +8,9 @@ model:
 xpu:
   host: xpu-host.example.com
   docker: your_xpu_container
-  cards: "0"  # Using 1 XPU card to avoid v1 engine multiprocess issues
+  cards: "2"  # Card 2 free (~64GB). TP1 required: hook-based hidden-state
+  # capture needs the model in-process (VLLM_ENABLE_V1_MULTIPROCESSING=0);
+  # TP>1 spawns worker subprocesses + hits oneCCL init failures on this host.
   device_type: xpu
   vllm_path: /workspace/vllm
   user: root

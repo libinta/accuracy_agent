@@ -36,6 +36,15 @@ class BisectionResult:
     divergent_layer: Optional[int]
     comparison_results: List[ComparisonResult] = field(default_factory=list)
     report: str = ""
+    # Parallel to comparison_results: (type_name, layer_index) describing what
+    # each comparison corresponds to. Populated by representative-layer runs so
+    # the report can label rows by layer KIND ("moe") rather than a bare index.
+    tested_layers: List[tuple] = field(default_factory=list)
+    # XPU-only extraction: no GPU peer was configured, so hidden states were
+    # captured on XPU alone (no comparison performed). extracted_path points at
+    # the saved tensor for a later GPU-vs-XPU comparison.
+    extracted_only: bool = False
+    extracted_path: Optional[str] = None
 
 class Bisector:
     """Hierarchical bisection engine for finding GPU/XPU divergences."""
@@ -49,6 +58,12 @@ class Bisector:
         """
         self.config = config
         self.model_info = model_info
+
+        # XPU-only mode: no GPU host configured, so we cannot do a GPU-vs-XPU
+        # comparison. Instead we extract XPU hidden states alone (the "small
+        # steps for big model" capture phase) and save them for a later
+        # comparison once a GPU peer is available.
+        self.xpu_only = not (config.gpu_host or config.gpu_docker)
 
         # Use backends if backend is specified
         if config.backend != "pytorch":
@@ -100,6 +115,13 @@ class Bisector:
             backend.setup()
             print(f"✓ {device_name} backend ready")
             return backend
+
+        # XPU-only mode: no GPU peer configured. Skip the GPU backend entirely
+        # (on an XPU-only host a "cuda" backend has no device and would land on
+        # a busy XPU card and fail) and set up only the XPU backend.
+        if self.xpu_only:
+            xpu_backend = setup_backend(xpu_config, "XPU")
+            return None, xpu_backend
 
         # Run GPU and XPU setup in parallel
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
@@ -153,6 +175,125 @@ class Bisector:
 
         return result
 
+    def _extract_xpu_only(
+        self,
+        layer_start: int,
+        layer_end: int
+    ) -> BisectionResult:
+        """Extract XPU hidden states without a GPU peer to compare against.
+
+        Used when no GPU host is configured. Runs the XPU backend for the
+        requested layer window, saves the captured hidden states into
+        ``output_dir`` (so they survive for a later GPU-vs-XPU comparison), and
+        returns a BisectionResult flagged as extraction-only.
+        """
+        print(f"XPU-only extraction of layers [{layer_start}, {layer_end}) "
+              f"(no GPU peer configured)...")
+
+        hidden_states = self.xpu_backend.run_layer_range(
+            layer_start, layer_end, self.config.test_prompt
+        )
+
+        out_dir = Path(self.config.output_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / f"hidden_states_xpu_{layer_start}_{layer_end}.pt"
+        torch.save(hidden_states, out_path)
+
+        report = (
+            f"XPU hidden states for layers [{layer_start}, {layer_end}) "
+            f"extracted to {out_path} (shape {tuple(hidden_states.shape)}). "
+            f"No GPU peer configured, so no comparison was performed."
+        )
+        print(f"✓ {report}")
+
+        return BisectionResult(
+            divergent_layer=None,
+            comparison_results=[],
+            report=report,
+            extracted_only=True,
+            extracted_path=str(out_path),
+        )
+
+    def bisect_layer_set(
+        self,
+        layer_groups: List[tuple]
+    ) -> BisectionResult:
+        """Compare a set of representative unique layers, one per layer type.
+
+        Unlike ``bisect_layers`` (which sweeps a contiguous range), this tests
+        exactly the (type_name, layer_index) representatives the model loader
+        derived -- so a MoE model exercises both a dense and a MoE layer instead
+        of only the dense prefix. Each representative layer N is captured via the
+        window [N, N+1); the make_layers clamp builds layers 0..N so layer N sees
+        the correct upstream residual stream before it is hooked.
+
+        Args:
+            layer_groups: list of (type_name, layer_index) to test.
+
+        Returns:
+            BisectionResult with one comparison per representative, labeled via
+            ``tested_layers``. divergent_layer is the first representative that
+            does not match (or None if all match).
+        """
+        try:
+            if self.use_backends:
+                needs_setup = self.xpu_backend is None or (
+                    not self.xpu_only and self.gpu_backend is None
+                )
+                if needs_setup:
+                    self.gpu_backend, self.xpu_backend = self._parallel_setup()
+
+            labels = [f"{name}@{idx}" for name, idx in layer_groups]
+            print(f"\n{'='*60}")
+            print(f"Comparing representative layers: {', '.join(labels)}")
+            print(f"{'='*60}\n")
+
+            # XPU-only mode has no GPU peer -- fall back to extracting each
+            # representative layer's hidden states without comparison.
+            if self.use_backends and self.xpu_only:
+                last = None
+                for _name, idx in layer_groups:
+                    last = self._extract_xpu_only(idx, idx + 1)
+                return last
+
+            results: List[ComparisonResult] = []
+            tested: List[tuple] = []
+            divergent = None
+
+            for name, idx in layer_groups:
+                if self.use_backends:
+                    result = self._test_layer_range_parallel(idx, idx + 1)
+                else:
+                    result = self._test_layer_range(idx, idx + 1)
+
+                results.append(result)
+                tested.append((name, idx))
+
+                if result.match:
+                    print(f"✓ Layer {idx} ({name}): {result.summary()}")
+                else:
+                    print(f"✗ Layer {idx} ({name}): {result.summary()}")
+                    if divergent is None:
+                        divergent = idx
+
+            if divergent is None:
+                report = "All representative layers match: " + ", ".join(labels)
+            else:
+                report = f"Divergence found in layer {divergent}"
+
+            return BisectionResult(
+                divergent_layer=divergent,
+                comparison_results=results,
+                report=report,
+                tested_layers=tested,
+            )
+        finally:
+            if self.use_backends:
+                if self.gpu_backend is not None:
+                    self.gpu_backend.cleanup()
+                if self.xpu_backend is not None:
+                    self.xpu_backend.cleanup()
+
     def bisect_layers(
         self,
         layer_start: int,
@@ -168,14 +309,22 @@ class Bisector:
             BisectionResult with divergent layer (if found)
         """
         try:
-            # Setup backends if using new backend system
+            # Setup backends if using new backend system. In XPU-only mode the
+            # GPU backend is intentionally None, so gate setup on the XPU one.
             if self.use_backends:
-                if self.gpu_backend is None or self.xpu_backend is None:
+                needs_setup = self.xpu_backend is None or (
+                    not self.xpu_only and self.gpu_backend is None
+                )
+                if needs_setup:
                     self.gpu_backend, self.xpu_backend = self._parallel_setup()
 
             print(f"\n{'='*60}")
             print(f"Bisecting layers {layer_start}-{layer_end}")
             print(f"{'='*60}\n")
+
+            # XPU-only extraction: capture XPU hidden states, no comparison.
+            if self.use_backends and self.xpu_only:
+                return self._extract_xpu_only(layer_start, layer_end)
 
             # Use parallel execution if backends available
             if self.use_backends:

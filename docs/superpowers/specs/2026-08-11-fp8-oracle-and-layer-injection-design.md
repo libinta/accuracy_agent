@@ -179,10 +179,31 @@ silently producing graph-captured garbage.
 
 ## Future Work
 
-- **Graph-boundary (piecewise-compiled) capture:** unblock with one experiment
-  — register a layer forward-hook with `enforce_eager=False` and check whether
-  it fires and matches eager within FP8 noise. If it fires, expose a
-  `compile: piecewise` mode for production-faithful numerics.
+- **Remote-GPU provisioning & auto-fix:** let the tool set up *and* repair the
+  remote GPU environment the way it already does for XPU — verify the container
+  / vLLM tree, apply the known patches (or a declarative patch catalog), and
+  surface a clear diagnosis when a host is unusable — instead of assuming a
+  ready GPU peer.
+- **TP>1 extraction:** per-worker capture and reassembly. The in-process
+  forward hook cannot see a model sharded across worker subprocesses (true for
+  both CUDA and XPU; not the oneCCL issue), so hidden states must be captured
+  inside each rank and stitched into the replicated residual stream.
+- **torch.compile / graph-boundary (piecewise-compiled) capture:** unblock with
+  one experiment — register a layer forward-hook with `enforce_eager=False` and
+  check whether it fires and matches eager within FP8 noise. If it fires, expose
+  a `compile: piecewise` mode for production-faithful numerics. (vLLM v1 runs
+  ~one graph per layer, so the inter-layer seam is preserved.)
 - **Behavioral oracle:** full-model token/top-k logit GPU-vs-XPU comparison, to
   catch fusion/stream/graph-replay divergence the eager per-layer path cannot.
-- **Deeper/more MoE layers** and **TP>1** per-worker capture.
+- **Deeper/more MoE layers.**
+
+## Progress
+
+- **Per-layer input injection (capture half) — DONE, proven on real GLM-5.2.**
+  `debug_runner.py` exposes two env-gated forward-pre-hooks on the deepest built
+  layer: `ACCURACY_SAVE_INPUT_PATH` (save the `{hidden_states, residual}` pair
+  entering the layer) and `ACCURACY_INJECT_INPUT_PATH` (override that input with
+  a saved reference). Self-test on layer 3 (MoE): inject-true-input reproduces
+  the real output (cos 1.000001); inject-zeros collapses it (cos 0.0) — proving
+  the override fires and drives the layer. Remaining for full verdicts: the
+  FP8-aware oracle and the GPU-golden cross-device wiring in `bisector.py`.

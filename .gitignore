@@ -55,3 +55,6 @@ env/
 # OS
 .DS_Store
 Thumbs.db
+
+# Local run config with real SSH/host info — never commit
+examples/glm52_gpuxpu_run.yaml

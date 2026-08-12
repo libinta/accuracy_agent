@@ -96,8 +96,15 @@ class VLLMBackend(Backend):
         if not self.is_patched:
             raise RuntimeError("Backend not setup - call setup() first")
 
-        # Generate output path on shared filesystem
-        output_path = Path(self.shared_fs) / f"hidden_states_{layer_start}_{layer_end}.pt"
+        # Generate output path on shared filesystem. The device_type is part of
+        # the filename because the GPU and XPU backends share the same shared_fs
+        # and run in parallel for the same layer range -- without it both would
+        # write (and then read back) the SAME file, racing so the comparison
+        # loads one device's tensor twice (spurious cos=1.0).
+        output_path = (
+            Path(self.shared_fs)
+            / f"hidden_states_{self.config.device_type}_{layer_start}_{layer_end}.pt"
+        )
 
         # Map memory mode vocabulary: "full"/"partial" -> "full_model"/"partial_layers"
         mode_map = {"full": "full_model", "partial": "partial_layers"}
@@ -106,10 +113,26 @@ class VLLMBackend(Backend):
         # Escape single quotes in prompt for shell safety
         prompt_escaped = prompt.replace("'", "'\\''")
 
+        # Select the target device(s) in the ENVIRONMENT, before python starts.
+        # `python -m vllm.model_executor.debug_runner` imports the vllm package
+        # (which initializes the Level-Zero / CUDA driver via torch and
+        # enumerates every visible device) BEFORE debug_runner's own module body
+        # runs -- so setting the mask from inside debug_runner is too late and is
+        # silently ignored, landing the run on the default (often busy) device 0.
+        # Exporting it in the launch command is the only point that takes effect.
+        cards = shlex.quote(str(self.config.cards))
+        if self.config.device_type == "xpu":
+            affinity_env = f"ZE_AFFINITY_MASK={cards} "
+        elif self.config.device_type == "cuda":
+            affinity_env = f"CUDA_VISIBLE_DEVICES={cards} "
+        else:
+            affinity_env = ""
+
         # Construct command to run debug_runner.py
         # Use shlex.quote for all paths and user-provided strings to prevent shell injection
         cmd = (
             f"cd {shlex.quote(self.config.vllm_path)} && "
+            f"{affinity_env}"
             f"python -m vllm.model_executor.debug_runner "
             f"--model-path {shlex.quote(self.model_path)} "
             f"--layer-start {layer_start} "
@@ -130,6 +153,17 @@ class VLLMBackend(Backend):
         # Check for errors (case-insensitive)
         if stderr and "error" in stderr.lower():
             raise RuntimeError(f"vLLM execution failed: {stderr}")
+
+        # A remote backend wrote output_path onto ITS filesystem, which the two
+        # containers generally do not share. Pull it (and the per-layer
+        # companion) back to this machine before the comparator reads them.
+        if not self.patcher.is_local:
+            fetched = self.patcher.copy_file_from_container(str(output_path), output_path)
+            if fetched:
+                self.patcher.copy_file_from_container(
+                    str(output_path) + ".alllayers",
+                    Path(str(output_path) + ".alllayers"),
+                )
 
         if not output_path.exists():
             raise RuntimeError(
