@@ -166,6 +166,17 @@ class VLLMPatcher:
         self.ssh_client.connect(**connect_kwargs)
         logger.info(f"Connected to {self.user}@{self.host}")
 
+    def connect_with_password(self, password: str) -> None:
+        """Establish SSH connection with password authentication (or skip if local)"""
+        if self.is_local:
+            logger.info(f"Running locally inside {self.docker}, skipping SSH connection")
+            return
+
+        self.ssh_client = paramiko.SSHClient()
+        self.ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        self.ssh_client.connect(self.host, username=self.user, password=password)
+        logger.info(f"Connected to {self.user}@{self.host} (password auth)")
+
     def disconnect(self) -> None:
         """Close SSH connection (no-op if running locally)"""
         if self.is_local:
