@@ -166,6 +166,17 @@ class VLLMPatcher:
         self.ssh_client.connect(**connect_kwargs)
         logger.info(f"Connected to {self.user}@{self.host}")
 
+    def connect_with_password(self, password: str) -> None:
+        """Establish SSH connection with password authentication (or skip if local)"""
+        if self.is_local:
+            logger.info(f"Running locally inside {self.docker}, skipping SSH connection")
+            return
+
+        self.ssh_client = paramiko.SSHClient()
+        self.ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        self.ssh_client.connect(self.host, username=self.user, password=password)
+        logger.info(f"Connected to {self.user}@{self.host} (password auth)")
+
     def disconnect(self) -> None:
         """Close SSH connection (no-op if running locally)"""
         if self.is_local:
@@ -523,15 +534,29 @@ class VLLMPatcher:
 
         anchors = self.patch_provider.get_anchor_points()
 
-        # Patch 1: default_loader.py for weight filtering
+        # Patch 1: default_loader.py for weight filtering.
+        # This targets the shared default_loader.py (not the model file), so the
+        # anchor is vLLM-version-specific, not model-specific: newer vLLM rewrote
+        # the weight iterator from a `for`-loop into a generator-expression return.
+        # Try the provider's (new) anchor first, then fall back to the old form so
+        # the model-specific path is as version-tolerant as _apply_generic_patches.
         loader_path = f"{self.vllm_path}/vllm/model_executor/model_loader/default_loader.py"
         weight_patch = self.patch_provider.get_weight_filter_patch()
-        self.apply_patch_to_file(
-            loader_path,
-            weight_patch,
-            anchor=anchors['weight_filter'],
-            insert_before=True
-        )
+        try:
+            self.apply_patch_to_file(
+                loader_path,
+                weight_patch,
+                anchor=anchors['weight_filter'],
+                insert_before=True
+            )
+        except RuntimeError:
+            # Fall back to old anchor for older vLLM versions
+            self.apply_patch_to_file(
+                loader_path,
+                weight_patch,
+                anchor="for name, param in weights_iterator:",
+                insert_before=True
+            )
 
         # Patch 2: Model-specific file for layer initialization
         model_file = self.patch_provider.get_model_file_path()
