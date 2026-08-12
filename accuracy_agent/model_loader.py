@@ -1,7 +1,7 @@
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Tuple
 
 @dataclass
 class ModelInfo:
@@ -12,6 +12,47 @@ class ModelInfo:
     layer_type: str  # "standard" or "sliding_window"
     sliding_window: Optional[int] = None
     sliding_window_pattern: Optional[List[int]] = None
+    # Representative layers to test: one (type_name, layer_index) per UNIQUE
+    # layer type the model has. The index is always the FIRST occurrence of
+    # that type, so the debug window [0, index+1) stays as small as possible
+    # (deeper occurrences would force building most of the model, which does
+    # not fit on a single card). Testing one representative per type is the
+    # "set of unique layers" the design calls for -- e.g. a MoE model gets a
+    # dense representative and a MoE representative rather than a trivial 0-N
+    # range that only exercises the dense prefix.
+    layer_groups: List[Tuple[str, int]] = field(default_factory=list)
+
+
+def _compute_layer_groups(config: dict, num_layers: int) -> List[Tuple[str, int]]:
+    """Derive representative unique layers from a model's config.json.
+
+    Returns a list of (type_name, first_occurrence_index). See ModelInfo.
+    """
+    # --- MoE lineage (DeepSeek / GLM-MoE): a dense prefix then MoE layers. ---
+    # `first_k_dense_replace` = number of leading dense layers; the rest are MoE.
+    n_experts = config.get("n_routed_experts") or config.get("num_experts")
+    first_k_dense = config.get("first_k_dense_replace")
+    if n_experts and first_k_dense is not None:
+        groups: List[Tuple[str, int]] = []
+        if first_k_dense > 0:
+            groups.append(("dense", 0))
+        if first_k_dense < num_layers:
+            groups.append(("moe", min(first_k_dense, num_layers - 1)))
+        return groups or [("standard", 0)]
+
+    # --- Sliding-window hybrid (e.g. Gemma): one full pattern cycle. ---
+    # sliding_window_pattern like [5, 1] = 5 sliding + 1 full. Test the first
+    # sliding layer and the first full layer (the two unique attention types).
+    pattern = config.get("sliding_window_pattern")
+    if isinstance(pattern, list) and len(pattern) >= 2 and "sliding_window" in config:
+        sliding_count = pattern[0]
+        groups = [("sliding_window", 0)]
+        if sliding_count < num_layers:
+            groups.append(("full_attention", min(sliding_count, num_layers - 1)))
+        return groups
+
+    # --- Fallback: a homogeneous model has one representative type. ---
+    return [("standard", 0)]
 
 def load_model_info(model_path: str) -> ModelInfo:
     """Load model architecture info from config.json.
@@ -52,5 +93,6 @@ def load_model_info(model_path: str) -> ModelInfo:
         num_attention_heads=num_attention_heads,
         layer_type=layer_type,
         sliding_window=config.get("sliding_window"),
-        sliding_window_pattern=config.get("sliding_window_pattern")
+        sliding_window_pattern=config.get("sliding_window_pattern"),
+        layer_groups=_compute_layer_groups(config, num_layers),
     )

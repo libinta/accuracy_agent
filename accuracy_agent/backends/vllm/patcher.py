@@ -3,6 +3,7 @@
 import paramiko
 import subprocess
 import socket
+import base64
 from pathlib import Path
 from typing import Optional, Callable
 import logging
@@ -100,10 +101,14 @@ class VLLMPatcher:
             if not Path("/.dockerenv").exists():
                 return False
 
-            # Primary detection: check if vllm_path exists locally
-            # If we're inside the container, the vllm path should be accessible
-            if Path(self.vllm_path).exists():
-                logger.debug(f"Found vllm_path {self.vllm_path} locally, assuming local execution")
+            # Primary detection: check if the vllm PACKAGE dir exists locally under
+            # vllm_path. We look for "{vllm_path}/vllm" (the package), not just
+            # vllm_path itself: a remote backend's vllm_path (e.g. a site-packages
+            # dir like /usr/local/lib/python3.12/dist-packages) can coincidentally
+            # exist in THIS container while its vllm package does not, which would
+            # otherwise mis-detect a remote GPU backend as local and run it here.
+            if (Path(self.vllm_path) / "vllm").exists():
+                logger.debug(f"Found vllm package under {self.vllm_path} locally, assuming local execution")
                 return True
 
             # Secondary: check hostname - may match docker name or host name
@@ -336,6 +341,67 @@ class VLLMPatcher:
 
         logger.info(f"Applied patch to {target_file}")
 
+    def replace_in_file(
+        self,
+        target_file: str,
+        replacements: list[tuple[str, str]],
+    ) -> int:
+        """
+        Apply literal (old -> new) string replacements to a file, idempotently.
+
+        Unlike apply_patch_to_file (anchored insertion), this does exact-string
+        substitution -- needed when a fix must both insert fields AND rewrite an
+        existing line (e.g. a tuple-unpack). Each replacement is skipped if its
+        `new` text is already present, so re-running is a no-op. Raises if an
+        `old` anchor is missing (and its `new` not yet applied), so a drifted
+        upstream file fails loudly instead of silently half-patching.
+
+        Args:
+            target_file: Absolute path to file inside container.
+            replacements: List of (old, new) literal string pairs, applied in order.
+
+        Returns:
+            Number of replacements actually applied.
+        """
+        self.backup_file(target_file)
+
+        stdout, stderr = self.exec_in_docker(f"cat {target_file}")
+        if stderr:
+            raise RuntimeError(f"Failed to read {target_file}: {stderr}")
+        content = stdout
+
+        applied = 0
+        for old, new in replacements:
+            if new in content:
+                continue  # already applied
+            if old not in content:
+                raise RuntimeError(
+                    f"Replacement anchor not found in {target_file}; upstream may "
+                    f"have drifted. Missing:\n{old[:120]}..."
+                )
+            content = content.replace(old, new, 1)
+            applied += 1
+
+        if applied == 0:
+            return 0
+
+        if self.is_local:
+            with open(target_file, 'w') as f:
+                f.write(content)
+        else:
+            temp_file = f"/tmp/vllm_patch_{Path(target_file).name}"
+            with self.ssh_client.open_sftp() as sftp:
+                with sftp.open(temp_file, 'w') as f:
+                    f.write(content)
+            docker_cp_cmd = f"docker cp {temp_file} {self.docker}:{target_file}"
+            stdin, stdout, stderr = self.ssh_client.exec_command(docker_cp_cmd)
+            stderr_str = stderr.read().decode()
+            if stderr_str:
+                raise RuntimeError(f"Failed to copy patched file into container: {stderr_str}")
+
+        logger.info(f"Applied {applied} replacement(s) to {target_file}")
+        return applied
+
     def copy_file_to_container(self, local_path: Path, container_path: str) -> None:
         """
         Copy file from local filesystem to docker container
@@ -372,6 +438,51 @@ class VLLMPatcher:
 
             logger.info(f"Copied {local_path} -> {container_path}")
 
+    def copy_file_from_container(self, container_path: str, local_path: Path) -> bool:
+        """
+        Copy a file OUT of the (possibly remote) docker container to a local path.
+
+        Uses base64 over `docker exec` so it works regardless of host/container
+        mount topology and is binary-safe -- the two backends in a GPU-vs-XPU
+        run generally do NOT share a writable filesystem, so a remote backend's
+        output cannot be read directly by the local comparator; it must be
+        pulled back first.
+
+        Args:
+            container_path: Absolute path to the file inside the container.
+            local_path: Destination path on the machine running this process.
+
+        Returns:
+            True if the file was fetched (or already local), False if the
+            source file does not exist in the container.
+        """
+        # Local backend: the file the container wrote IS on this filesystem.
+        if self.is_local:
+            return Path(container_path).exists()
+
+        # Confirm the source exists before attempting a (potentially large) read.
+        check_out, _ = self.exec_in_docker(
+            f"[ -f {container_path} ] && echo EXISTS || echo MISSING"
+        )
+        if "EXISTS" not in check_out:
+            return False
+
+        # base64-encode inside the container; decode locally. Binary-safe and
+        # mount-topology-agnostic.
+        stdout, stderr = self.exec_in_docker(f"base64 {container_path}")
+        if not stdout:
+            raise RuntimeError(
+                f"Failed to read {container_path} from container "
+                f"{self.docker}: {stderr}"
+            )
+
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(local_path, "wb") as f:
+            f.write(base64.b64decode(stdout))
+
+        logger.info(f"Fetched {self.docker}:{container_path} -> {local_path}")
+        return True
+
     def apply_all_patches(self) -> None:
         """Apply all vLLM patches with proper anchored insertion"""
         logger.info("Applying vLLM patches...")
@@ -394,6 +505,14 @@ class VLLMPatcher:
 
         # Apply architecture-agnostic layer-limiting fix (make_layers)
         self._apply_make_layers_fix()
+
+        # Sync XPU sparse-MLA backend to the refactored shared MLA forward
+        # (no-op on non-XPU vLLM trees where the file is absent)
+        self._apply_sparse_mla_fix()
+
+        # Pad ragged-N FP8 block-scaled GEMM so oneDNN XPU matmul accepts it
+        # (no-op on non-XPU vLLM trees where the file is absent)
+        self._apply_fp8_gemm_fix()
 
         logger.info("All patches applied successfully")
 
@@ -579,6 +698,188 @@ if _aa_start is not None and _aa_end is not None:
                 "Falling back to model-specific layer patches (may OOM on large models)."
             )
 
+    def _apply_sparse_mla_fix(self) -> None:
+        """Sync the XPU sparse-MLA backend to the refactored shared MLA forward.
+
+        The shared vllm/model_executor/layers/attention/mla_attention.py
+        forward_impl was refactored to expect CUDA-sparse-shaped attention
+        metadata (num_decodes/num_prefills/num_decode_tokens/prefill_max_seq_len
+        /prefill) and a split MQA/MHA impl (masked_mha_available,
+        supports_quant_query_input, dcp/pcp_world_size). The XPU sparse backend
+        (xpu_mla_sparse.py) was never updated, so a GLM-5.2 forward on XPU dies
+        with AttributeError. XPU sparse only implements the MQA path
+        (forward_mqa handles BOTH prefill and decode via the 576/512 sparse
+        kernel), so we add the missing metadata fields and hard-disable the MHA
+        branches -- routing the whole batch through forward_mqa.
+
+        XPU-only file; on a CUDA vLLM tree it is absent and this is a no-op.
+        """
+        logger.info("Applying XPU sparse-MLA metadata/impl fix...")
+
+        sparse_path = f"{self.vllm_path}/vllm/v1/attention/backends/mla/xpu_mla_sparse.py"
+
+        # Skip cleanly if the file doesn't exist (e.g. CUDA-only vLLM build).
+        stdout, _ = self.exec_in_docker(f"test -f {sparse_path} && echo yes || echo no")
+        if stdout.strip() != "yes":
+            logger.info(f"{sparse_path} not present; skipping (non-XPU vLLM tree).")
+            return
+
+        replacements = [
+            # 1) import the decode/prefill splitter used by the builder
+            (
+                "from vllm.v1.kv_cache_interface import AttentionSpec",
+                "from vllm.v1.kv_cache_interface import AttentionSpec\n"
+                "from vllm.v1.attention.backends.utils import split_decodes_and_prefills",
+            ),
+            # 2) add metadata fields the shared forward_impl reads
+            (
+                "    num_actual_tokens: int  # Number of tokens excluding padding.\n"
+                "    query_start_loc: torch.Tensor",
+                "    num_actual_tokens: int  # Number of tokens excluding padding.\n"
+                "    num_decode_tokens: int  # Tokens belonging to decode requests.\n"
+                "    num_decodes: int  # Number of decode requests.\n"
+                "    num_prefills: int  # Number of prefill requests.\n"
+                "    query_start_loc: torch.Tensor",
+            ),
+            # 3) add defaulted fields; prefill=None forces the MQA-only path
+            (
+                "    block_size: int = 1\n"
+                "    topk_tokens: int = 2048",
+                "    block_size: int = 1\n"
+                "    topk_tokens: int = 2048\n"
+                "    # Sparse FlashMLA uses the MQA path for BOTH prefill and decode, so we\n"
+                "    # never build a separate MHA prefill metadata; leaving prefill=None makes\n"
+                "    # the shared MLAAttention.forward_impl route all tokens through forward_mqa.\n"
+                "    prefill_max_seq_len: int = 0\n"
+                "    prefill: object = None",
+            ),
+            # 4) compute + populate the new fields in the builder
+            (
+                "        req_id_per_token = self.req_id_per_token_buffer[:num_tokens]\n\n"
+                "        metadata = XPUMLASparseMetadata(\n"
+                "            num_reqs=common_attn_metadata.num_reqs,\n"
+                "            max_query_len=common_attn_metadata.max_query_len,\n"
+                "            max_seq_len=common_attn_metadata.max_seq_len,\n"
+                "            num_actual_tokens=common_attn_metadata.num_actual_tokens,",
+                "        req_id_per_token = self.req_id_per_token_buffer[:num_tokens]\n\n"
+                "        num_decodes, num_prefills, num_decode_tokens, _ = split_decodes_and_prefills(\n"
+                "            common_attn_metadata, decode_threshold=1\n"
+                "        )\n\n"
+                "        metadata = XPUMLASparseMetadata(\n"
+                "            num_reqs=common_attn_metadata.num_reqs,\n"
+                "            max_query_len=common_attn_metadata.max_query_len,\n"
+                "            max_seq_len=common_attn_metadata.max_seq_len,\n"
+                "            num_actual_tokens=common_attn_metadata.num_actual_tokens,\n"
+                "            num_decode_tokens=num_decode_tokens,\n"
+                "            num_decodes=num_decodes,\n"
+                "            num_prefills=num_prefills,\n"
+                "            prefill_max_seq_len=common_attn_metadata.max_seq_len,",
+            ),
+            # 5) add impl-side attrs so forward_impl keeps the batch on forward_mqa
+            (
+                "class XPUMLASparseImpl(MLAAttentionImpl[XPUMLASparseMetadata]):\n"
+                "    is_sparse = True\n",
+                "class XPUMLASparseImpl(MLAAttentionImpl[XPUMLASparseMetadata]):\n"
+                "    is_sparse = True\n"
+                "    # The refactored shared MLAAttention.forward_impl queries these on every\n"
+                "    # sparse impl. XPU sparse only implements the MQA path (forward_mqa handles\n"
+                "    # BOTH prefill and decode), so hard-disable every MHA branch to force the\n"
+                "    # whole batch through forward_mqa.\n"
+                "    masked_mha_available = False\n"
+                "    supports_quant_query_input = False\n"
+                "    dcp_world_size = 1\n"
+                "    pcp_world_size = 1\n\n"
+                "    @staticmethod\n"
+                "    def masked_mha_workspace_fits(prefill) -> bool:\n"
+                "        return False\n",
+            ),
+        ]
+
+        try:
+            n = self.replace_in_file(sparse_path, replacements)
+            logger.info(f"XPU sparse-MLA fix applied ({n} change(s)).")
+        except RuntimeError as e:
+            logger.warning(
+                f"Could not apply XPU sparse-MLA fix: {e}. "
+                "This is OK if the XPU vLLM already carries the fix or uses a "
+                "non-sparse MLA backend."
+            )
+
+    def _apply_fp8_gemm_fix(self) -> None:
+        """Pad the ragged-N FP8 block-scaled GEMM so oneDNN XPU matmul accepts it.
+
+        GLM-5.2 MLA fused_qkv_a_proj projects to N = q_lora_rank(2048) +
+        kv_lora_rank(512) + qk_rope_head_dim(64) = 2624 = 20*128 + 64, a ragged
+        final N-block. oneDNN v3.12.0's XPU matmul rejects grouped (block) scales
+        along N when N is not a multiple of the 128 block size ("unsupported
+        scales configuration", src/common/matmul.cpp:311). Per-tensor/token/
+        channel scales are fine; only the grouped-along-N ragged case fails.
+
+        Fix: pad the weight rows up to the next multiple of 128 with zeros (the
+        padding maps onto the existing final scale block and contributes 0 to
+        every output), run the gemm, then slice the output columns back to N.
+        Divisible-N GEMMs keep the original single-call path.
+
+        XPU-only file; on a CUDA vLLM tree it is absent and this is a no-op.
+        """
+        logger.info("Applying XPU FP8 block-scaled GEMM N-padding fix...")
+
+        gemm_path = (
+            f"{self.vllm_path}/vllm/model_executor/kernels/linear/scaled_mm/xpu.py"
+        )
+
+        stdout, _ = self.exec_in_docker(f"test -f {gemm_path} && echo yes || echo no")
+        if stdout.strip() != "yes":
+            logger.info(f"{gemm_path} not present; skipping (non-XPU vLLM tree).")
+            return
+
+        replacements = [
+            (
+                "        return torch.ops._xpu_C.fp8_gemm(\n"
+                "            A,\n"
+                "            B.t(),\n"
+                "            self.config.out_dtype,\n"
+                "            As,\n"
+                "            Bs.t(),\n"
+                "            torch.Tensor(),\n"
+                "        )",
+                "        # ACCURACY_AGENT PATCH: oneDNN XPU matmul (v3.12.0) rejects grouped\n"
+                "        # scales along N when N is not a multiple of the 128 block size\n"
+                "        # (unsupported scales configuration, matmul.cpp:311). GLM-5.2 MLA\n"
+                "        # fused_qkv_a_proj has N=2624=20*128+64 (ragged last block). Pad N up\n"
+                "        # to a multiple of 128 with zero rows (they map to the existing final\n"
+                "        # scale block and contribute 0), run the gemm, then slice back to N.\n"
+                "        N = B.shape[0]\n"
+                "        Bst = Bs.t().contiguous()\n"
+                "        if N % 128 != 0:\n"
+                "            Npad = ((N + 127) // 128) * 128\n"
+                "            Bpad = torch.zeros(Npad, B.shape[1], dtype=B.dtype, device=B.device)\n"
+                "            Bpad[:N] = B\n"
+                "            out = torch.ops._xpu_C.fp8_gemm(\n"
+                "                A, Bpad.t(), self.config.out_dtype, As, Bst, torch.Tensor()\n"
+                "            )\n"
+                "            return out[:, :N]\n"
+                "        return torch.ops._xpu_C.fp8_gemm(\n"
+                "            A,\n"
+                "            B.t(),\n"
+                "            self.config.out_dtype,\n"
+                "            As,\n"
+                "            Bst,\n"
+                "            torch.Tensor(),\n"
+                "        )",
+            ),
+        ]
+
+        try:
+            n = self.replace_in_file(gemm_path, replacements)
+            logger.info(f"XPU FP8 GEMM N-padding fix applied ({n} change(s)).")
+        except RuntimeError as e:
+            logger.warning(
+                f"Could not apply XPU FP8 GEMM fix: {e}. "
+                "This is OK if the XPU vLLM already carries the fix or the kernel "
+                "file has drifted upstream."
+            )
+
     def cleanup(self) -> None:
         """Restore all original files"""
         logger.info("Cleaning up vLLM patches...")
@@ -588,6 +889,8 @@ if _aa_start is not None and _aa_end is not None:
             f"{self.vllm_path}/vllm/model_executor/models/llama.py",
             f"{self.vllm_path}/vllm/utils/mem_utils.py",
             f"{self.vllm_path}/vllm/model_executor/models/utils.py",
+            f"{self.vllm_path}/vllm/v1/attention/backends/mla/xpu_mla_sparse.py",
+            f"{self.vllm_path}/vllm/model_executor/kernels/linear/scaled_mm/xpu.py",
         ]
 
         # Add model-specific file if using model-specific patches

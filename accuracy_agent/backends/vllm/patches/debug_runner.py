@@ -6,6 +6,42 @@ This script is copied into vLLM source tree during patching.
 import argparse
 import os
 import sys
+
+
+def _set_device_affinity_from_argv() -> None:
+    """Select the target device(s) BEFORE torch is imported.
+
+    Importing torch initializes the Level-Zero (XPU) / CUDA driver and
+    enumerates every visible device. Setting ZE_AFFINITY_MASK /
+    CUDA_VISIBLE_DEVICES *after* that point is silently ignored, so vLLM would
+    land on the default device 0 (often busy) regardless of --cards. We peek at
+    --cards/--device from argv and set the mask up front. No-op when the flags
+    are absent (e.g. imported as a module rather than run via CLI).
+    """
+    argv = sys.argv
+
+    def _get(flag: str):
+        if flag in argv:
+            i = argv.index(flag)
+            if i + 1 < len(argv):
+                return argv[i + 1]
+        prefix = flag + "="
+        for a in argv:
+            if a.startswith(prefix):
+                return a.split("=", 1)[1]
+        return None
+
+    cards = _get("--cards")
+    device = _get("--device") or "cuda"
+    if cards:
+        if device == "xpu":
+            os.environ["ZE_AFFINITY_MASK"] = cards
+        elif device == "cuda":
+            os.environ["CUDA_VISIBLE_DEVICES"] = cards
+
+
+_set_device_affinity_from_argv()
+
 import torch
 from pathlib import Path
 
@@ -46,7 +82,10 @@ def run_partial_layers(
     if layer_end < 0:
         raise ValueError(f"layer_end must be non-negative, got {layer_end}")
 
-    # Set device visibility and calculate tensor parallel size
+    # Set device visibility and calculate tensor parallel size. When invoked via
+    # the CLI, _set_device_affinity_from_argv() already set this BEFORE the torch
+    # import (which is the only point at which it takes effect); this re-set is a
+    # harmless fallback for programmatic callers that import the module first.
     num_cards = len(cards.split(','))
     if device == "cuda":
         os.environ["CUDA_VISIBLE_DEVICES"] = cards
@@ -176,12 +215,85 @@ def run_partial_layers(
 
     handles = []
     for i in range(layer_start, min(layer_end, len(layers))):
-        # partial_layers mode packs the window at the front of the list.
-        layer_pos = (i - layer_start) if load_mode == "partial_layers" else i
+        # The make_layers clamp always builds the window at its NATURAL
+        # positions (ACCURACY_DEBUG_LAYER_START is pinned to "0", END to
+        # layer_end), so layers[i] is model-layer i in every mode. Do NOT
+        # offset by layer_start: that assumed the window was packed at the
+        # front of the list, which it is not -- it made every single-layer
+        # window [N, N+1) hook layers[0] and capture layer 0's output.
+        layer_pos = i
         if layer_pos >= len(layers):
             print(f"Warning: layer index {layer_pos} out of range (max {len(layers)-1})")
             break
         handles.append(layers[layer_pos].register_forward_hook(make_hook(i)))
+
+    # --- Per-layer input injection / reference capture (isolated-forward mode) ---
+    # ACCURACY_SAVE_INPUT_PATH: during a normal forward, save the
+    #   (hidden_states, residual) pair ENTERING the deepest tested layer. That
+    #   pair is the golden reference input for that layer.
+    # ACCURACY_INJECT_INPUT_PATH: override the deepest tested layer's input with
+    #   a previously-saved reference so the layer's OWN kernel is measured on an
+    #   identical input regardless of upstream drift (per-layer isolation).
+    # Both act on the deepest built layer (layer_end-1). GLM/deepseek decoder
+    # layers are called positionally as forward(positions, hidden_states,
+    # residual); we fall back to kwargs by name if that ever changes.
+    save_input_path = os.environ.get("ACCURACY_SAVE_INPUT_PATH")
+    inject_input_path = os.environ.get("ACCURACY_INJECT_INPUT_PATH")
+    tested_pos = min(layer_end, len(layers)) - 1
+
+    def _find_hs_res(args, kwargs):
+        """Locate (hidden_states, residual) in a decoder layer's call."""
+        if "hidden_states" in kwargs:
+            return kwargs.get("hidden_states"), kwargs.get("residual"), "kwargs"
+        hs = args[1] if len(args) > 1 else None
+        res = args[2] if len(args) > 2 else None
+        return hs, res, "args"
+
+    if save_input_path:
+        def save_pre_hook(module, args, kwargs):
+            hs, res, _ = _find_hs_res(args, kwargs)
+            payload = {
+                "hidden_states": hs.detach().to(torch.float32).cpu() if hs is not None else None,
+                "residual": res.detach().to(torch.float32).cpu() if res is not None else None,
+            }
+            Path(save_input_path).parent.mkdir(parents=True, exist_ok=True)
+            torch.save(payload, save_input_path)
+            print(f"[inject] saved layer {tested_pos} input reference "
+                  f"(hs={None if hs is None else tuple(hs.shape)}, "
+                  f"res={None if res is None else tuple(res.shape)}) -> {save_input_path}")
+            return None  # observe only; do not modify inputs
+        handles.append(layers[tested_pos].register_forward_pre_hook(
+            save_pre_hook, with_kwargs=True))
+
+    if inject_input_path:
+        _ref = torch.load(inject_input_path)
+
+        def inject_pre_hook(module, args, kwargs):
+            hs, res, kind = _find_hs_res(args, kwargs)
+            hs_ref = _ref.get("hidden_states")
+            res_ref = _ref.get("residual")
+            # Reference lives on CPU/f32; move to the live tensor's device+dtype.
+            dev = hs.device if hs is not None else (res.device if res is not None else None)
+            dt = hs.dtype if hs is not None else (res.dtype if res is not None else None)
+            hs_new = hs_ref.to(device=dev, dtype=dt) if hs_ref is not None else hs
+            res_new = res_ref.to(device=dev, dtype=dt) if res_ref is not None else res
+            print(f"[inject] overriding layer {tested_pos} input with reference "
+                  f"(hs={None if hs_new is None else tuple(hs_new.shape)}, "
+                  f"res={None if res_new is None else tuple(res_new.shape)})")
+            if kind == "kwargs":
+                kwargs = dict(kwargs)
+                kwargs["hidden_states"] = hs_new
+                if "residual" in kwargs:
+                    kwargs["residual"] = res_new
+                return args, kwargs
+            new_args = list(args)
+            if len(new_args) > 1:
+                new_args[1] = hs_new
+            if len(new_args) > 2:
+                new_args[2] = res_new
+            return tuple(new_args), kwargs
+        handles.append(layers[tested_pos].register_forward_pre_hook(
+            inject_pre_hook, with_kwargs=True))
 
     # Run a real 1-token generation so vLLM builds the forward context. The
     # model was constructed with only layers [0, layer_end) (the rest are cheap

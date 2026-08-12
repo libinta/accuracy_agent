@@ -93,17 +93,25 @@ def main(config, model, gpu_host, gpu_docker, xpu_host, xpu_docker, shared_fs, o
     bisector = Bisector(debug_config, model_info)
 
     try:
-        result = bisector.bisect_layers(
-            debug_config.layer_start,
-            debug_config.layer_end
-        )
+        if debug_config.layer_select == "auto":
+            groups = model_info.layer_groups or [("standard", debug_config.layer_start)]
+            reps = ", ".join(f"{n}@{i}" for n, i in groups)
+            console.print(f"[yellow]Auto-selected representative layers: {reps}[/yellow]\n")
+            result = bisector.bisect_layer_set(groups)
+        else:
+            result = bisector.bisect_layers(
+                debug_config.layer_start,
+                debug_config.layer_end
+            )
 
         # Print results
         console.print("\n" + "="*60)
         console.print("[bold]Bisection Results[/bold]")
         console.print("="*60 + "\n")
 
-        if result.divergent_layer is not None:
+        if getattr(result, "extracted_only", False):
+            console.print("[green]✓ XPU hidden states extracted (no GPU peer to compare)[/green]")
+        elif result.divergent_layer is not None:
             console.print(f"[red]✗ Divergence found in layer {result.divergent_layer}[/red]")
         else:
             console.print("[green]✓ All layers match![/green]")
@@ -122,8 +130,16 @@ def main(config, model, gpu_host, gpu_docker, xpu_host, xpu_docker, shared_fs, o
                 status = "✓ Match" if comp.match else "✗ Diverge"
                 style = "green" if comp.match else "red"
 
+                # Label by layer KIND when representative layers were tested;
+                # otherwise fall back to the contiguous-range index.
+                if result.tested_layers and i < len(result.tested_layers):
+                    name, idx = result.tested_layers[i]
+                    layer_label = f"Layer {idx} ({name})"
+                else:
+                    layer_label = f"Layer {debug_config.layer_start + i}"
+
                 comp_table.add_row(
-                    f"Layer {debug_config.layer_start + i}",
+                    layer_label,
                     f"[{style}]{status}[/{style}]",
                     f"{comp.cosine_similarity:.6f}",
                     f"{comp.max_rel_error:.6f}"
