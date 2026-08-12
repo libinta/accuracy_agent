@@ -1,0 +1,23 @@
+# Test XPU backend only with partial weight loading
+
+backend: vllm
+
+model:
+  path: /mnt/weka/data/customer-models/GLM-5.2-FP8
+
+xpu:
+  host: xpu-host.example.com
+  docker: your_xpu_container
+  cards: "0"  # Using 1 XPU card to avoid v1 engine multiprocess issues
+  device_type: xpu
+  vllm_path: /workspace/vllm
+  user: root
+  ssh_key_path: /path/to/ssh/private_key
+
+shared_fs: /mnt/weka
+output_dir: /mnt/weka/accuracy_debug_xpu_only
+
+test:
+  layer_start: 0
+  layer_end: 3
+  prompt: "What is the capital of France?"

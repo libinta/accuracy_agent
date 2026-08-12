@@ -1,0 +1,32 @@
+# Test configuration for GLM-5.2-FP8 GPU/XPU accuracy testing
+
+backend: vllm
+
+model:
+  path: /mnt/weka/data/customer-models/GLM-5.2-FP8
+
+gpu:
+  host: gpu-host.example.com
+  docker: your_gpu_container
+  cards: "6,7"  # Using 2 GPU cards
+  device_type: cuda
+  vllm_path: /root/github/gpu/vllm
+  user: youruser
+  ssh_key_path: /path/to/ssh/private_key
+
+xpu:
+  host: xpu-host.example.com
+  docker: your_xpu_container
+  cards: "0,1"  # Using 2 XPU cards to match GPU
+  device_type: xpu
+  vllm_path: /workspace/vllm
+  user: root
+  ssh_key_path: /path/to/ssh/private_key
+
+shared_fs: /mnt/weka
+output_dir: /mnt/weka/accuracy_debug_glm52_vllm
+
+test:
+  layer_start: 0
+  layer_end: 3
+  prompt: "What is the capital of France?"

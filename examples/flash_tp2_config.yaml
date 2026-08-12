@@ -1,0 +1,20 @@
+# examples/flash_tp2_config.yaml
+# Configuration for DeepSeek-V4-Flash TP2 accuracy test
+
+model:
+  path: /mnt/weka/data/pytorch/huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash/snapshots/60d8d70770c6776ff598c94bb586a859a38244f1
+
+gpu:
+  host: gpu-host.example.com
+  docker: your_gpu_container
+
+xpu:
+  host: xpu-host.example.com
+  docker: your_xpu_container
+
+shared_fs: /mnt/weka
+output_dir: /mnt/weka/accuracy_debug_output
+
+test:
+  layer_start: 0
+  layer_end: 6  # Test first 6 layers for POC

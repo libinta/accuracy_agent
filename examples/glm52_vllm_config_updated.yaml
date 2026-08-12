@@ -1,0 +1,27 @@
+# Configuration for GLM-5.2-FP8 with vLLM backend
+backend: vllm
+
+model:
+  path: /mnt/weka/data/customer-models/GLM-5.2-FP8
+
+gpu:
+  host: gpu-host.example.com
+  user: youruser
+  docker: your_gpu_container
+  vllm_path: /root/github/gpu/vllm
+  cards: "4,5"
+
+xpu:
+  host: xpu-host.example.com
+  user: youruser
+  docker: your_xpu_container
+  vllm_path: /workspace/vllm
+  cards: "0,1,2,3,4,5,6,7"
+
+shared_fs: /mnt/weka
+output_dir: /mnt/weka/accuracy_debug_glm52_vllm
+
+test:
+  layer_start: 0
+  layer_end: 3
+  prompt: "What is the capital of France?"

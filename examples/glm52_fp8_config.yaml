@@ -1,0 +1,21 @@
+# Configuration for GLM-5.2-FP8 GPU/XPU accuracy testing
+
+model:
+  path: /mnt/weka/data/customer-models/GLM-5.2-FP8
+
+gpu:
+  host: gpu-host.example.com
+  docker: your_gpu_container
+  cards: "6,7"  # Reserved GPU cards on gpu-host
+
+xpu:
+  host: xpu-host.example.com
+  docker: your_xpu_container
+  cards: "0,1,2,3,4,5,6,7"  # ZE_AFFINITY_MASK for XPU
+
+shared_fs: /mnt/weka
+output_dir: /mnt/weka/accuracy_debug_glm52
+
+test:
+  layer_start: 0
+  layer_end: 3  # Test first 3 layers for POC

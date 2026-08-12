@@ -1,0 +1,39 @@
+# Configuration for GLM-5.2-FP8 GPU/XPU accuracy testing with vLLM backend
+
+backend: vllm  # Use vLLM backend (vs "pytorch")
+
+model:
+  path: /mnt/weka/data/customer-models/GLM-5.2-FP8
+
+gpu:
+  host: gpu-host.example.com
+  docker: gpu_container_name
+  cards: "6,7"
+  device_type: cuda
+  vllm_path: /workspace/github/gpu/vllm  # vLLM installation path
+  user: username
+  ssh_key_path: /path/to/.ssh/id_rsa  # Optional: SSH private key path
+
+xpu:
+  host: xpu-host.example.com
+  docker: xpu_container_name
+  cards: "0,1,2,3,4,5,6,7"
+  device_type: xpu
+  vllm_path: /workspace/github/vllm
+  user: root
+  ssh_key_path: /path/to/.ssh/id_rsa  # Optional: SSH private key path
+
+shared_fs: /mnt/weka
+output_dir: /mnt/weka/accuracy_debug_glm52_vllm
+
+test:
+  layer_start: 0
+  layer_end: 3  # Test first 3 layers
+  prompt: "What is the capital of France?"
+
+# Notes:
+# - This tool can run from:
+#   1. A control host with SSH access to both GPU and XPU hosts
+#   2. Inside one of the docker containers (will use local execution for that backend, SSH for the other)
+# - If ssh_key_path is not specified, paramiko will look for keys in default locations
+# - When running from inside a docker container, ensure openssh-client is installed

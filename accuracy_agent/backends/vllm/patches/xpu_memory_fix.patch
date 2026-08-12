@@ -1,0 +1,38 @@
+--- a/vllm/utils/mem_utils.py
++++ b/vllm/utils/mem_utils.py
+@@ -1,6 +1,7 @@
+ import time
+ from dataclasses import dataclass
+ import psutil
++import subprocess
+
+ import torch
+
+@@ -45,7 +46,26 @@ class MemorySnapshot:
+         self.torch_allocated = stats.get("allocated_bytes.all.current", 0)
+
+         self.free_memory, self.total_memory = torch.accelerator.get_memory_info(device)
++
++        # ACCURACY_AGENT PATCH: Fix XPU memory detection bug
++        # torch.xpu.get_memory_info() incorrectly returns (0, total) instead of (free, total)
++        if device.type == 'xpu':
++            # For XPU, get_memory_info returns incorrect free_memory (always 0)
++            # Work around by calculating: free = total - allocated
++            if self.free_memory == 0 and self.total_memory > 0:
++                # Use torch's internal tracking instead
++                try:
++                    allocated = torch.xpu.memory_allocated(device)
++                    reserved = torch.xpu.memory_reserved(device)
++                    # Free memory is total minus what's actually reserved by PyTorch
++                    # Be conservative: assume what PyTorch doesn't know about takes 10% of total
++                    self.free_memory = int(self.total_memory * 0.9 - reserved)
++                    if self.free_memory < 0:
++                        self.free_memory = 0
++                except Exception:
++                    # Fallback: assume 80% is free if we can't measure
++                    self.free_memory = int(self.total_memory * 0.8)
++        # END ACCURACY_AGENT PATCH
++
+         if current_platform.is_integrated_gpu(device.index):
+             # On UMA (Unified Memory Architecture) platforms where CPU and
+             # GPU share physical memory (e.g. GH200, DGX Spark, Jetson Orin),
