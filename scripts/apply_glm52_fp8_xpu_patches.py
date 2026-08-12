@@ -138,6 +138,25 @@ def replace_literals(path: Path, replacements: list[tuple[str, str]]) -> str:
     return f"patched ({applied} change(s))"
 
 
+def replace_one_of(path: Path, old_variants: list[str], new: str) -> str:
+    """Rewrite the first of several known `old` forms found in the file to `new`.
+
+    Used where the target line has drifted across vLLM versions: we accept any
+    known shape and normalize it to the patched shape. Idempotent via MARKER
+    (the patched shape carries it); loud if none of the variants are present."""
+    if not path.exists():
+        return "absent (skipped)"
+    content = path.read_text()
+    if MARKER in content:
+        return "already applied"
+    for old in old_variants:
+        if old in content:
+            backup(path)
+            path.write_text(content.replace(old, new, 1))
+            return "patched (1 change(s))"
+    return "ANCHOR NOT FOUND -- fp8_gemm call shape drifted; not patched"
+
+
 # --------------------------------------------------------------------------- #
 # Patch 1: XPU memory-detection fix (mem_utils.py)
 # --------------------------------------------------------------------------- #
@@ -232,42 +251,57 @@ SPARSE_REPLACEMENTS: list[tuple[str, str]] = [
 # --------------------------------------------------------------------------- #
 # Patch 3: FP8 block-scaled GEMM N-padding (scaled_mm/xpu.py)
 # --------------------------------------------------------------------------- #
-GEMM_REPLACEMENTS: list[tuple[str, str]] = [
-    (
-        "        return torch.ops._xpu_C.fp8_gemm(\n"
-        "            A,\n"
-        "            B.t(),\n"
-        "            self.config.out_dtype,\n"
-        "            As,\n"
-        "            Bs.t(),\n"
-        "            torch.Tensor(),\n"
-        "        )",
-        "        # " + MARKER + ": oneDNN XPU matmul (v3.12.0) rejects grouped scales\n"
-        "        # along N when N is not a multiple of the 128 block size (unsupported\n"
-        "        # scales configuration, matmul.cpp:311). GLM-5.2 MLA fused_qkv_a_proj has\n"
-        "        # N=2624=20*128+64 (ragged last block). Pad N up to a multiple of 128 with\n"
-        "        # zero rows (they map to the existing final scale block and contribute 0),\n"
-        "        # run the gemm, then slice back to N.\n"
-        "        N = B.shape[0]\n"
-        "        Bst = Bs.t().contiguous()\n"
-        "        if N % 128 != 0:\n"
-        "            Npad = ((N + 127) // 128) * 128\n"
-        "            Bpad = torch.zeros(Npad, B.shape[1], dtype=B.dtype, device=B.device)\n"
-        "            Bpad[:N] = B\n"
-        "            out = torch.ops._xpu_C.fp8_gemm(\n"
-        "                A, Bpad.t(), self.config.out_dtype, As, Bst, torch.Tensor()\n"
-        "            )\n"
-        "            return out[:, :N]\n"
-        "        return torch.ops._xpu_C.fp8_gemm(\n"
-        "            A,\n"
-        "            B.t(),\n"
-        "            self.config.out_dtype,\n"
-        "            As,\n"
-        "            Bst,\n"
-        "            torch.Tensor(),\n"
-        "        )",
-    ),
+# The bare fp8_gemm call has appeared in two known shapes across vLLM versions:
+# the accuracy-tool-era form (`Bs.t()`) and the current form that already carries
+# the transposed-scale contiguity fix (`Bs.t().contiguous()`). Both still LACK the
+# ragged-N pad, so we match whichever is present and rewrite it to the padded form.
+# The replacement uses Bst = Bs.t().contiguous() in every path, so it is correct
+# regardless of which variant it replaced.
+GEMM_OLD_VARIANTS: list[str] = [
+    "        return torch.ops._xpu_C.fp8_gemm(\n"
+    "            A,\n"
+    "            B.t(),\n"
+    "            self.config.out_dtype,\n"
+    "            As,\n"
+    "            Bs.t(),\n"
+    "            torch.Tensor(),\n"
+    "        )",
+    "        return torch.ops._xpu_C.fp8_gemm(\n"
+    "            A,\n"
+    "            B.t(),\n"
+    "            self.config.out_dtype,\n"
+    "            As,\n"
+    "            Bs.t().contiguous(),\n"
+    "            torch.Tensor(),\n"
+    "        )",
 ]
+
+GEMM_NEW = (
+    "        # " + MARKER + ": oneDNN XPU matmul (v3.12.0) rejects grouped scales\n"
+    "        # along N when N is not a multiple of the 128 block size (unsupported\n"
+    "        # scales configuration, matmul.cpp:311). GLM-5.2 MLA fused_qkv_a_proj has\n"
+    "        # N=2624=20*128+64 (ragged last block). Pad N up to a multiple of 128 with\n"
+    "        # zero rows (they map to the existing final scale block and contribute 0),\n"
+    "        # run the gemm, then slice back to N.\n"
+    "        N = B.shape[0]\n"
+    "        Bst = Bs.t().contiguous()\n"
+    "        if N % 128 != 0:\n"
+    "            Npad = ((N + 127) // 128) * 128\n"
+    "            Bpad = torch.zeros(Npad, B.shape[1], dtype=B.dtype, device=B.device)\n"
+    "            Bpad[:N] = B\n"
+    "            out = torch.ops._xpu_C.fp8_gemm(\n"
+    "                A, Bpad.t(), self.config.out_dtype, As, Bst, torch.Tensor()\n"
+    "            )\n"
+    "            return out[:, :N]\n"
+    "        return torch.ops._xpu_C.fp8_gemm(\n"
+    "            A,\n"
+    "            B.t(),\n"
+    "            self.config.out_dtype,\n"
+    "            As,\n"
+    "            Bst,\n"
+    "            torch.Tensor(),\n"
+    "        )"
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -297,7 +331,7 @@ def main() -> int:
     results = {
         "1. XPU memory detection": insert_after_anchor(targets["1. XPU memory detection"], MEM_ANCHOR, MEM_BLOCK),
         "2. sparse-MLA backend  ": replace_literals(targets["2. sparse-MLA backend  "], SPARSE_REPLACEMENTS),
-        "3. FP8 GEMM N-pad      ": replace_literals(targets["3. FP8 GEMM N-pad      "], GEMM_REPLACEMENTS),
+        "3. FP8 GEMM N-pad      ": replace_one_of(targets["3. FP8 GEMM N-pad      "], GEMM_OLD_VARIANTS, GEMM_NEW),
     }
 
     failed = False
