@@ -46,6 +46,121 @@ import torch
 from pathlib import Path
 
 
+def _aa_capture_layers(model, layer_start, layer_end, save_input_path=None,
+                       inject_ref=None):
+    """Register forward hooks on the decoder layers and return (captured, handles).
+
+    Runs either in the driver (TP=1, in-process worker) OR inside each TP worker
+    process (TP>1, via collective_rpc). Kept SELF-CONTAINED (imports locally, no
+    reliance on run_partial_layers' closures) so it works identically in a
+    separate worker process.
+
+    captured[abs_idx] = post-layer residual stream (hidden_states + residual),
+    detached to CPU float32. For TP>1 the decoder-layer output is all-reduced, so
+    every rank holds identical full-width hidden states.
+    """
+    import torch
+    from pathlib import Path
+
+    # Locate the decoder stack regardless of wrapper depth. Multimodal
+    # *ForConditionalGeneration wrappers (KimiK25...) keep the text model under
+    # .language_model with the stack at language_model.model.layers.
+    inner = getattr(model, "language_model", model)
+    if hasattr(inner, "model") and hasattr(inner.model, "layers"):
+        layers = inner.model.layers
+    elif hasattr(inner, "layers"):
+        layers = inner.layers
+    else:
+        layers = model.model.layers if hasattr(model, "model") else model.layers
+
+    captured = {}
+    handles = []
+
+    def make_hook(abs_idx):
+        def hook(module, args, output):
+            if isinstance(output, tuple):
+                hs = output[0]
+                res = output[1] if len(output) > 1 else None
+                combined = hs + res if res is not None else hs
+            else:
+                combined = output
+            captured[abs_idx] = combined.detach().to(torch.float32).cpu()
+        return hook
+
+    n = min(layer_end, len(layers))
+    for i in range(layer_start, n):
+        handles.append(layers[i].register_forward_hook(make_hook(i)))
+
+    # Optional per-layer input isolation, acting on the deepest built layer.
+    tested_pos = n - 1
+
+    def _find_hs_res(args, kwargs):
+        if "hidden_states" in kwargs:
+            return kwargs.get("hidden_states"), kwargs.get("residual"), "kwargs"
+        hs = args[1] if len(args) > 1 else None
+        res = args[2] if len(args) > 2 else None
+        return hs, res, "args"
+
+    if save_input_path and tested_pos >= 0:
+        def save_pre_hook(module, args, kwargs):
+            hs, res, _ = _find_hs_res(args, kwargs)
+            payload = {
+                "hidden_states": hs.detach().to(torch.float32).cpu() if hs is not None else None,
+                "residual": res.detach().to(torch.float32).cpu() if res is not None else None,
+            }
+            Path(save_input_path).parent.mkdir(parents=True, exist_ok=True)
+            torch.save(payload, save_input_path)
+            return None
+        handles.append(layers[tested_pos].register_forward_pre_hook(
+            save_pre_hook, with_kwargs=True))
+
+    if inject_ref is not None and tested_pos >= 0:
+        def inject_pre_hook(module, args, kwargs):
+            hs, res, kind = _find_hs_res(args, kwargs)
+            hs_ref = inject_ref.get("hidden_states")
+            res_ref = inject_ref.get("residual")
+            dev = hs.device if hs is not None else (res.device if res is not None else None)
+            dt = hs.dtype if hs is not None else (res.dtype if res is not None else None)
+            hs_new = hs_ref.to(device=dev, dtype=dt) if hs_ref is not None else hs
+            res_new = res_ref.to(device=dev, dtype=dt) if res_ref is not None else res
+            if kind == "kwargs":
+                kwargs = dict(kwargs)
+                kwargs["hidden_states"] = hs_new
+                if "residual" in kwargs:
+                    kwargs["residual"] = res_new
+                return args, kwargs
+            new_args = list(args)
+            if len(new_args) > 1:
+                new_args[1] = hs_new
+            if len(new_args) > 2:
+                new_args[2] = res_new
+            return tuple(new_args), kwargs
+        handles.append(layers[tested_pos].register_forward_pre_hook(
+            inject_pre_hook, with_kwargs=True))
+
+    return captured, handles
+
+
+def _aa_worker_register(worker, layer_start, layer_end, save_input_path, inject_ref):
+    """collective_rpc entrypoint (runs inside a TP worker process): register the
+    capture hooks and stash state on the worker for a later collect. Only rank 0
+    writes the save-input reference (all ranks hold identical hidden states)."""
+    is_rank0 = getattr(worker, "rank", 0) == 0
+    captured, handles = _aa_capture_layers(
+        worker.model_runner.model, layer_start, layer_end,
+        save_input_path if is_rank0 else None, inject_ref)
+    worker._aa_captured = captured
+    worker._aa_handles = handles
+    return len(handles)
+
+
+def _aa_worker_collect(worker):
+    """collective_rpc entrypoint: remove hooks and return this rank's captures."""
+    for h in getattr(worker, "_aa_handles", []):
+        h.remove()
+    return getattr(worker, "_aa_captured", {})
+
+
 def run_partial_layers(
     model_path: str,
     layer_start: int,
@@ -136,17 +251,25 @@ def run_partial_layers(
 
     vllm.config.ModelConfig.__init__ = patched_init
 
-    # Load model with vLLM
-    print(f"Loading model from {model_path} with mode={load_mode}, tensor_parallel_size={num_cards}")
+    # Load model with vLLM. Memory knobs are env-tunable because a single MoE
+    # layer's int4 weights + XPU weight-processing peak can consume the whole
+    # gpu_memory_utilization budget on small (e.g. 24GB) cards, leaving nothing
+    # for KV cache ("No available memory for the cache blocks"). Raise util
+    # and/or shrink max_model_len (smaller profiling peak + KV requirement).
+    #   ACCURACY_GPU_MEM_UTIL  (default 0.90)
+    #   ACCURACY_MAX_MODEL_LEN (default 1024)
+    gpu_mem_util = float(os.environ.get("ACCURACY_GPU_MEM_UTIL", "0.90"))
+    max_model_len = int(os.environ.get("ACCURACY_MAX_MODEL_LEN", "1024"))
+    print(f"Loading model from {model_path} with mode={load_mode}, "
+          f"tensor_parallel_size={num_cards}, gpu_mem_util={gpu_mem_util}, "
+          f"max_model_len={max_model_len}")
     llm = LLM(
         model=model_path,
         trust_remote_code=True,
         enforce_eager=True,
-        gpu_memory_utilization=0.8,  # Weights (debug window is a few layers) are
-        # small; use most of the *free* card (shared card: ~26/30 GiB free, so
-        # 0.9 trips the startup check) so KV-cache blocks can be allocated.
+        gpu_memory_utilization=gpu_mem_util,
         tensor_parallel_size=num_cards,
-        max_model_len=2048,  # Small ctx: shrinks KV-cache + profiling peak
+        max_model_len=max_model_len,  # Small ctx: shrinks KV-cache + profiling peak
         max_num_seqs=1,  # Single-seq profiling → smaller dummy-run peak
         disable_custom_all_reduce=True,  # Avoid multiprocess worker init issues
     )
@@ -159,8 +282,14 @@ def run_partial_layers(
     #   v0: llm.llm_engine.model_executor.driver_worker.model_runner.model
     #   v1: llm.llm_engine.engine_core.engine_core.model_executor
     #           .driver_worker.model_runner.model   (in-process EngineCore)
-    def _resolve_model(engine: object) -> object:
-        # Find the executor regardless of v0/v1 wrapping.
+    def _resolve_worker_or_executor(engine):
+        """Return ("worker", in_process_worker) for TP=1, or ("executor", exec)
+        for TP>1 (workers are separate processes reached via collective_rpc).
+
+        The EngineCore is forced in-process (VLLM_ENABLE_V1_MULTIPROCESSING=0),
+        so the executor object is always reachable here; only the TP workers may
+        live in other processes.
+        """
         executor = getattr(engine, "model_executor", None)
         if executor is None:
             # v1: engine.engine_core is an InprocClient wrapping the EngineCore.
@@ -174,137 +303,57 @@ def run_partial_layers(
             )
         worker = getattr(executor, "driver_worker", None)
         if worker is None:
-            # UniProcExecutor may expose workers as a list.
             workers = getattr(executor, "workers", None)
             worker = workers[0] if workers else None
-        if worker is None:
-            raise AttributeError("Could not locate driver_worker on the executor.")
-        # worker may be a WorkerWrapperBase; unwrap to the real worker.
-        worker = getattr(worker, "worker", worker)
-        return worker.model_runner.model
+        worker = getattr(worker, "worker", worker) if worker is not None else None
+        # TP=1: the worker is in THIS process and exposes model_runner directly.
+        if worker is not None and hasattr(worker, "model_runner"):
+            return "worker", worker
+        # TP>1: workers are separate processes (WorkerProcHandle). Register and
+        # collect hooks INSIDE them via the executor's collective_rpc, which runs
+        # our callable on every rank and returns the per-rank results.
+        if hasattr(executor, "collective_rpc"):
+            return "executor", executor
+        raise RuntimeError(
+            "No in-process worker and the executor exposes no collective_rpc; "
+            "cannot extract hidden states for this TP configuration."
+        )
 
-    model = _resolve_model(llm.llm_engine)
+    kind, target = _resolve_worker_or_executor(llm.llm_engine)
 
-    # Locate the decoder layer list regardless of wrapper depth.
-    if hasattr(model, 'model'):
-        layers = model.model.layers
-    else:
-        layers = model.layers
-
-    # Capture hidden states via forward HOOKS during a real engine forward.
-    # Manually calling a DeepseekV2DecoderLayer outside the engine fails: MLA
-    # attention needs the per-step forward context (attn metadata + KV cache)
-    # that only the engine's execute_model sets up. Hooks observe the true
-    # forward without our having to reconstruct that context or the layer's
-    # (positions, hidden_states, residual) call convention.
-    captured = {}
-
-    def make_hook(abs_idx: int):
-        def hook(module, args, output):
-            # Decoder layers return (hidden_states, residual). The post-layer
-            # hidden state is hidden_states + residual (the next layer's
-            # input_layernorm / final norm consumes their sum), so store that.
-            if isinstance(output, tuple):
-                hs = output[0]
-                res = output[1] if len(output) > 1 else None
-                combined = hs + res if res is not None else hs
-            else:
-                combined = output
-            captured[abs_idx] = combined.detach().to(torch.float32).cpu()
-        return hook
-
-    handles = []
-    for i in range(layer_start, min(layer_end, len(layers))):
-        # The make_layers clamp always builds the window at its NATURAL
-        # positions (ACCURACY_DEBUG_LAYER_START is pinned to "0", END to
-        # layer_end), so layers[i] is model-layer i in every mode. Do NOT
-        # offset by layer_start: that assumed the window was packed at the
-        # front of the list, which it is not -- it made every single-layer
-        # window [N, N+1) hook layers[0] and capture layer 0's output.
-        layer_pos = i
-        if layer_pos >= len(layers):
-            print(f"Warning: layer index {layer_pos} out of range (max {len(layers)-1})")
-            break
-        handles.append(layers[layer_pos].register_forward_hook(make_hook(i)))
-
-    # --- Per-layer input injection / reference capture (isolated-forward mode) ---
-    # ACCURACY_SAVE_INPUT_PATH: during a normal forward, save the
-    #   (hidden_states, residual) pair ENTERING the deepest tested layer. That
-    #   pair is the golden reference input for that layer.
-    # ACCURACY_INJECT_INPUT_PATH: override the deepest tested layer's input with
-    #   a previously-saved reference so the layer's OWN kernel is measured on an
-    #   identical input regardless of upstream drift (per-layer isolation).
-    # Both act on the deepest built layer (layer_end-1). GLM/deepseek decoder
-    # layers are called positionally as forward(positions, hidden_states,
-    # residual); we fall back to kwargs by name if that ever changes.
+    # Optional per-layer input isolation (see _aa_capture_layers): observe the
+    # deepest layer's input, or override it with a saved reference.
     save_input_path = os.environ.get("ACCURACY_SAVE_INPUT_PATH")
     inject_input_path = os.environ.get("ACCURACY_INJECT_INPUT_PATH")
-    tested_pos = min(layer_end, len(layers)) - 1
+    inject_ref = torch.load(inject_input_path) if inject_input_path else None
+    reg_args = (layer_start, layer_end, save_input_path, inject_ref)
 
-    def _find_hs_res(args, kwargs):
-        """Locate (hidden_states, residual) in a decoder layer's call."""
-        if "hidden_states" in kwargs:
-            return kwargs.get("hidden_states"), kwargs.get("residual"), "kwargs"
-        hs = args[1] if len(args) > 1 else None
-        res = args[2] if len(args) > 2 else None
-        return hs, res, "args"
+    # Register capture hooks. TP=1 -> in-process; TP>1 -> ship the registration
+    # into every worker process via collective_rpc (cloudpickled).
+    local_state = None
+    if kind == "worker":
+        local_state = _aa_capture_layers(target.model_runner.model, *reg_args)
+    else:
+        target.collective_rpc(_aa_worker_register, args=reg_args)
 
-    if save_input_path:
-        def save_pre_hook(module, args, kwargs):
-            hs, res, _ = _find_hs_res(args, kwargs)
-            payload = {
-                "hidden_states": hs.detach().to(torch.float32).cpu() if hs is not None else None,
-                "residual": res.detach().to(torch.float32).cpu() if res is not None else None,
-            }
-            Path(save_input_path).parent.mkdir(parents=True, exist_ok=True)
-            torch.save(payload, save_input_path)
-            print(f"[inject] saved layer {tested_pos} input reference "
-                  f"(hs={None if hs is None else tuple(hs.shape)}, "
-                  f"res={None if res is None else tuple(res.shape)}) -> {save_input_path}")
-            return None  # observe only; do not modify inputs
-        handles.append(layers[tested_pos].register_forward_pre_hook(
-            save_pre_hook, with_kwargs=True))
-
-    if inject_input_path:
-        _ref = torch.load(inject_input_path)
-
-        def inject_pre_hook(module, args, kwargs):
-            hs, res, kind = _find_hs_res(args, kwargs)
-            hs_ref = _ref.get("hidden_states")
-            res_ref = _ref.get("residual")
-            # Reference lives on CPU/f32; move to the live tensor's device+dtype.
-            dev = hs.device if hs is not None else (res.device if res is not None else None)
-            dt = hs.dtype if hs is not None else (res.dtype if res is not None else None)
-            hs_new = hs_ref.to(device=dev, dtype=dt) if hs_ref is not None else hs
-            res_new = res_ref.to(device=dev, dtype=dt) if res_ref is not None else res
-            print(f"[inject] overriding layer {tested_pos} input with reference "
-                  f"(hs={None if hs_new is None else tuple(hs_new.shape)}, "
-                  f"res={None if res_new is None else tuple(res_new.shape)})")
-            if kind == "kwargs":
-                kwargs = dict(kwargs)
-                kwargs["hidden_states"] = hs_new
-                if "residual" in kwargs:
-                    kwargs["residual"] = res_new
-                return args, kwargs
-            new_args = list(args)
-            if len(new_args) > 1:
-                new_args[1] = hs_new
-            if len(new_args) > 2:
-                new_args[2] = res_new
-            return tuple(new_args), kwargs
-        handles.append(layers[tested_pos].register_forward_pre_hook(
-            inject_pre_hook, with_kwargs=True))
-
-    # Run a real 1-token generation so vLLM builds the forward context. The
-    # model was constructed with only layers [0, layer_end) (the rest are cheap
-    # PPMissingLayer via our make_layers clamp), so the decoder stack naturally
-    # stops after the requested window.
+    # Run a real 1-token generation so vLLM builds the forward context. Only
+    # layers [0, layer_end) are real modules (make_layers clamp); the rest are
+    # cheap PPMissingLayer, so the decoder stack stops after the window.
     from vllm import SamplingParams
-    print(f"Running engine forward to capture layers [{layer_start}, {layer_end})")
+    print(f"Running engine forward to capture layers [{layer_start}, {layer_end}) "
+          f"(TP path: {kind})")
     llm.generate([prompt], SamplingParams(max_tokens=1, temperature=0.0))
 
-    for h in handles:
-        h.remove()
+    # Collect captures and drop hooks.
+    if kind == "worker":
+        captured, handles = local_state
+        for h in handles:
+            h.remove()
+    else:
+        per_rank = target.collective_rpc(_aa_worker_collect)
+        # Decoder-layer output hidden states are all-reduced across TP ranks, so
+        # every rank holds the identical full-width tensor -- take rank 0's.
+        captured = next((c for c in per_rank if c), {})
 
     if not captured:
         raise RuntimeError(
