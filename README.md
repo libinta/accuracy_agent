@@ -22,6 +22,38 @@ accuracy-debug \
   --layer-end 3
 ```
 
+If the XPU docker runs on the same machine as the tool, the GPU side can be
+omitted: the vLLM version is read out of the XPU container and the matching
+`vllm/vllm-openai` release image is pulled and started automatically.
+
+```bash
+accuracy-debug \
+  --backend vllm \
+  --model /mnt/weka/models/DeepSeek-V4-Flash \
+  --xpu-docker your_xpu_container \
+  --shared-fs /mnt/weka
+```
+
+See `examples/local_xpu_auto_gpu.yaml` and the "Automatic GPU Docker Selection"
+section of `examples/README_vllm.md`.
+
+To test a specific `vllm-project/vllm` commit instead of a release, both peers
+can be built from it — the commit is installed from source into the vendor
+PyTorch images (`nvcr.io/nvidia/pytorch` and
+`intel/intel-extension-for-pytorch`), so the two sides differ only in device:
+
+```bash
+accuracy-debug \
+  --backend vllm \
+  --model /mnt/weka/models/DeepSeek-V4-Flash \
+  --vllm-commit 7794b1e08bf505ff28664515ffaaeeec955ab796
+```
+
+CUDA kernels come from the nearest nightly wheel by default (minutes); add
+`--build-kernels` to compile them at that commit (1–2 h) when it touches
+C++/CUDA. See `examples/vllm_commit_config.yaml` and the "Testing One vLLM
+Commit on Both Devices" section of `examples/README_vllm.md`.
+
 ## Status
 
 **Phase 1 POC**: Core bisection engine + DeepSeek-V4-Flash validation

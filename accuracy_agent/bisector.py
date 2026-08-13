@@ -12,6 +12,7 @@ from accuracy_agent.test_harness_generator import generate_test_harness, save_te
 from accuracy_agent.comparator import compare_tensors, ComparisonResult
 from accuracy_agent.backends.factory import create_backend
 from accuracy_agent.backends.base import BackendConfig, Backend
+from accuracy_agent.vllm_source_builder import maybe_autoconfigure_peers
 
 def _extract_compare_tensor(data: dict) -> "torch.Tensor":
     """Pull the tensor to compare out of a harness output dict.
@@ -59,6 +60,13 @@ class Bisector:
         self.config = config
         self.model_info = model_info
 
+        # Fill in the docker peers that were left unset: built from vllm_commit,
+        # or matched to the XPU container's vLLM version. Must run BEFORE
+        # xpu_only is computed below, since a successful setup is what turns a
+        # would-be XPU-only run into a real GPU-vs-XPU comparison. No-op when
+        # both sides are already configured.
+        maybe_autoconfigure_peers(config)
+
         # XPU-only mode: no GPU host configured, so we cannot do a GPU-vs-XPU
         # comparison. Instead we extract XPU hidden states alone (the "small
         # steps for big model" capture phase) and save them for a later
@@ -90,7 +98,8 @@ class Bisector:
             cards=self.config.gpu_cards,
             device_type="cuda",
             user=self.config.gpu_user,
-            ssh_key_path=self.config.gpu_ssh_key_path
+            ssh_key_path=self.config.gpu_ssh_key_path,
+            inside_container=self.config.gpu_inside_container
         )
 
         xpu_config = BackendConfig(
@@ -100,7 +109,8 @@ class Bisector:
             cards=self.config.xpu_cards,
             device_type="xpu",
             user=self.config.xpu_user,
-            ssh_key_path=self.config.xpu_ssh_key_path
+            ssh_key_path=self.config.xpu_ssh_key_path,
+            inside_container=self.config.xpu_inside_container
         )
 
         def setup_backend(config: BackendConfig, device_name: str):

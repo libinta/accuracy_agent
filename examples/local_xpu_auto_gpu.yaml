@@ -1,0 +1,45 @@
+# GPU/XPU accuracy testing with the GPU side configured automatically.
+#
+# There is no `gpu:` section at all: because the XPU docker runs on this machine,
+# the tool reads the vLLM version out of the XPU container, picks the matching
+# vllm/vllm-openai RELEASE image (never a nightly), and starts a container from
+# it -- so both sides run the same vLLM version without anyone looking it up.
+#
+#   $ python3 -m accuracy_agent.cli --config examples/local_xpu_auto_gpu.yaml
+#   Matching GPU docker image to the XPU vLLM version...
+#   ✓ XPU vLLM 0.26.1rc1.dev353+g7794b1e08.xpu -> vllm/vllm-openai:v0.26.0 \
+#     (nearest release) container=accuracy_agent_gpu_v0.26.0
+#
+# Requirements: a docker CLI and an NVIDIA GPU on this machine (otherwise the
+# automation stays out of the way and the run falls back to XPU-only
+# extraction), and the shared filesystem below available to both containers.
+#
+# Opt out with `gpu.auto_image: false` or `--no-auto-gpu-image`.
+
+backend: vllm
+
+model:
+  path: /mnt/weka/data/customer-models/GLM-5.2-FP8
+
+xpu:
+  host: localhost          # local: required for the GPU side to be auto-derived
+  docker: your_xpu_container
+  cards: "0"
+  device_type: xpu
+  vllm_path: /workspace/vllm
+  user: root
+
+# The GPU section can be omitted entirely. Add it only to override what the
+# automation picks, e.g.:
+# gpu:
+#   cards: "0"                       # which GPU(s) to run on (default "0")
+#   image: vllm/vllm-openai:v0.26.0  # pin the image instead of matching versions
+#   auto_image: false                # disable the automation completely
+
+shared_fs: /mnt/weka                 # bind-mounted into the auto-launched container
+output_dir: /mnt/weka/accuracy_debug_auto_gpu
+
+test:
+  layer_start: 0
+  layer_end: 3
+  prompt: "What is the capital of France?"

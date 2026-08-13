@@ -8,21 +8,43 @@ from rich.table import Table
 from accuracy_agent.config import DebugConfig
 from accuracy_agent.model_loader import load_model_info
 from accuracy_agent.bisector import Bisector
+from accuracy_agent.vllm_source_builder import maybe_autoconfigure_peers
 
 console = Console()
 
 @click.command()
 @click.option('--config', type=click.Path(exists=True), help='Config YAML file')
 @click.option('--model', type=str, help='Model path (overrides config)')
+@click.option('--backend', type=click.Choice(['vllm', 'pytorch', 'sglang']), default=None,
+              help='Inference backend (default: pytorch, or the value in --config)')
 @click.option('--gpu-host', type=str, help='GPU host')
 @click.option('--gpu-docker', type=str, help='GPU docker container')
 @click.option('--xpu-host', type=str, help='XPU host')
 @click.option('--xpu-docker', type=str, help='XPU docker container')
+@click.option('--gpu-image', type=str, help='GPU docker image (default: matched to the XPU vLLM version)')
+@click.option('--no-auto-gpu-image', is_flag=True, default=False,
+              help='Do not derive/launch the GPU docker from the XPU vLLM version')
+@click.option('--vllm-commit', type=str, default=None,
+              help='vllm-project/vllm commit (sha/tag/branch) to install from source '
+                   'into the vendor PyTorch images on both sides')
+@click.option('--vllm-repo', type=str, default=None,
+              help='Local vllm-project/vllm clone to resolve --vllm-commit in (default: ~/vllm)')
+@click.option('--build-kernels', is_flag=True, default=False,
+              help='With --vllm-commit: compile CUDA kernels at that commit (1-2h) instead '
+                   'of using the precompiled nightly wheel')
+@click.option('--rebuild-vllm', is_flag=True, default=False,
+              help='With --vllm-commit: ignore cached built images and install again')
+@click.option('--gpu-base-image', type=str, default=None,
+              help='Base image for the built GPU peer (default: newest nvcr.io/nvidia/pytorch)')
+@click.option('--xpu-base-image', type=str, default=None,
+              help='Base image for the built XPU peer (default: newest intel/intel-extension-for-pytorch)')
 @click.option('--shared-fs', type=str, default='/mnt/weka', help='Shared filesystem path')
 @click.option('--output-dir', type=str, help='Output directory on shared FS')
 @click.option('--layer-start', type=int, default=None, help='First layer to test')
 @click.option('--layer-end', type=int, default=None, help='Last layer to test (exclusive)')
-def main(config, model, gpu_host, gpu_docker, xpu_host, xpu_docker, shared_fs, output_dir, layer_start, layer_end):
+def main(config, model, backend, gpu_host, gpu_docker, xpu_host, xpu_docker, gpu_image,
+         no_auto_gpu_image, vllm_commit, vllm_repo, build_kernels, rebuild_vllm,
+         gpu_base_image, xpu_base_image, shared_fs, output_dir, layer_start, layer_end):
     """XPU Accuracy Debugger - Find GPU/XPU divergences automatically."""
 
     console.print("[bold cyan]XPU Accuracy Debugger POC[/bold cyan]\n")
@@ -35,6 +57,8 @@ def main(config, model, gpu_host, gpu_docker, xpu_host, xpu_docker, shared_fs, o
         # Override with CLI arguments if provided
         if model:
             debug_config.model_path = model
+        if backend:
+            debug_config.backend = backend
         if gpu_host:
             debug_config.gpu_host = gpu_host
         if gpu_docker:
@@ -43,6 +67,22 @@ def main(config, model, gpu_host, gpu_docker, xpu_host, xpu_docker, shared_fs, o
             debug_config.xpu_host = xpu_host
         if xpu_docker:
             debug_config.xpu_docker = xpu_docker
+        if gpu_image:
+            debug_config.gpu_image = gpu_image
+        if no_auto_gpu_image:
+            debug_config.gpu_auto_image = False
+        if vllm_commit:
+            debug_config.vllm_commit = vllm_commit
+        if vllm_repo:
+            debug_config.vllm_repo_path = vllm_repo
+        if build_kernels:
+            debug_config.vllm_build_kernels = True
+        if rebuild_vllm:
+            debug_config.vllm_build_rebuild = True
+        if gpu_base_image:
+            debug_config.gpu_base_image = gpu_base_image
+        if xpu_base_image:
+            debug_config.xpu_base_image = xpu_base_image
         if shared_fs != '/mnt/weka':  # Check if non-default
             debug_config.shared_fs = shared_fs
         if output_dir:
@@ -52,31 +92,83 @@ def main(config, model, gpu_host, gpu_docker, xpu_host, xpu_docker, shared_fs, o
         if layer_end is not None:
             debug_config.layer_end = layer_end
     else:
-        # CLI args only
-        if not all([model, gpu_host, gpu_docker, xpu_host, xpu_docker]):
-            console.print("[red]Error: Must provide either --config or all required arguments[/red]")
+        # CLI args only. Both docker sides are optional: --vllm-commit builds
+        # them, and otherwise a local XPU docker is enough to derive the GPU side
+        # from its vLLM version.
+        if not model or not (xpu_docker or vllm_commit):
+            console.print(
+                "[red]Error: Must provide either --config, or --model plus "
+                "--xpu-docker (or --vllm-commit to build both peers)[/red]"
+            )
             return
 
         debug_config = DebugConfig(
             model_path=model,
-            gpu_host=gpu_host,
-            gpu_docker=gpu_docker,
-            xpu_host=xpu_host,
-            xpu_docker=xpu_docker,
+            backend=backend or "pytorch",
+            gpu_host=gpu_host or "",
+            gpu_docker=gpu_docker or "",
+            xpu_host=xpu_host or "",
+            xpu_docker=xpu_docker or "",
+            gpu_image=gpu_image or "",
+            gpu_auto_image=not no_auto_gpu_image,
+            vllm_commit=vllm_commit or "",
+            vllm_repo_path=vllm_repo or "",
+            vllm_build_kernels=build_kernels,
+            vllm_build_rebuild=rebuild_vllm,
+            gpu_base_image=gpu_base_image or "",
+            xpu_base_image=xpu_base_image or "",
             shared_fs=shared_fs,
             output_dir=output_dir or f"{shared_fs}/accuracy_debug_output",
             layer_start=layer_start if layer_start is not None else 0,
             layer_end=layer_end if layer_end is not None else 3
         )
 
+    # Fill in the docker peers automatically (build them from --vllm-commit, or
+    # match a release image to the XPU container's version) before the config is
+    # printed, so the table below reflects what the run will actually use.
+    needs_peers = debug_config.backend == "vllm" and (
+        debug_config.vllm_commit
+        or (not debug_config.gpu_docker and debug_config.gpu_auto_image)
+    )
+    if needs_peers:
+        if debug_config.vllm_commit:
+            console.print(
+                f"[yellow]Building vLLM @ {debug_config.vllm_commit} for both peers "
+                f"({'compiling CUDA kernels' if debug_config.vllm_build_kernels else 'precompiled kernels'})"
+                "...[/yellow]"
+            )
+        else:
+            console.print("[yellow]Matching GPU docker image to the XPU vLLM version...[/yellow]")
+
+        setup = maybe_autoconfigure_peers(debug_config)
+        for line in setup.summary_lines():
+            console.print(f"[green]✓ {line}[/green]" if not line.startswith("note:")
+                          else f"[yellow]  {line}[/yellow]")
+        if not setup.configured:
+            # Report why, since the CLI does not configure logging.
+            for reason in setup.skipped:
+                console.print(f"[yellow]  {reason}[/yellow]")
+            console.print(
+                "[yellow]No peer auto-configured; continuing "
+                "(XPU-only unless --gpu-docker is given).[/yellow]"
+            )
+        console.print()
+
     # Print config
     table = Table(title="Configuration")
     table.add_column("Parameter", style="cyan")
     table.add_column("Value", style="white")
 
+    table.add_row("Backend", debug_config.backend)
     table.add_row("Model", debug_config.model_path)
-    table.add_row("GPU", f"{debug_config.gpu_host} / {debug_config.gpu_docker}")
-    table.add_row("XPU", f"{debug_config.xpu_host} / {debug_config.xpu_docker}")
+    if debug_config.vllm_commit:
+        table.add_row("vLLM commit", debug_config.vllm_commit)
+    table.add_row("GPU", f"{debug_config.gpu_host or 'localhost'} / {debug_config.gpu_docker or '(none)'}")
+    if debug_config.gpu_image:
+        table.add_row("GPU image", debug_config.gpu_image)
+    table.add_row("XPU", f"{debug_config.xpu_host or 'localhost'} / {debug_config.xpu_docker or '(none)'}")
+    if debug_config.xpu_image:
+        table.add_row("XPU image", debug_config.xpu_image)
     table.add_row("Layers", f"{debug_config.layer_start}-{debug_config.layer_end}")
     table.add_row("Output", debug_config.output_dir)
 

@@ -13,6 +13,13 @@ gpu:
   vllm_path: /workspace/github/gpu/vllm  # vLLM installation path
   user: username
   ssh_key_path: /path/to/.ssh/id_rsa  # Optional: SSH private key path
+  # Optional GPU docker automation (see examples/local_xpu_auto_gpu.yaml).
+  # Leave `docker` empty and the tool reads the vLLM version out of the XPU
+  # container and starts the matching vllm/vllm-openai RELEASE image itself.
+  # auto_image: true          # default; false disables the automation
+  # image: vllm/vllm-openai:v0.11.0   # pin an image instead of matching versions
+  # container_name: my_gpu_container  # name for the auto-launched container
+  # docker_run_args: "--network=host" # extra raw `docker run` flags
 
 xpu:
   host: xpu-host.example.com

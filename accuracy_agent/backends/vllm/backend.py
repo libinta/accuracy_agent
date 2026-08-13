@@ -35,6 +35,7 @@ class VLLMBackend(Backend):
             vllm_path=config.vllm_path,
             user=config.user,
             model_name=model_name,
+            inside_container=getattr(config, "inside_container", None),
         )
         self.is_patched = False
         self.memory_mode = None  # Will be set in setup()

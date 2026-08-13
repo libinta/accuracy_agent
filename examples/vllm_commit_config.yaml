@@ -1,0 +1,60 @@
+# Compare one vllm-project/vllm commit on GPU vs XPU.
+#
+# Both peers are built from the same commit and installed into the vendor
+# PyTorch images, so a divergence cannot be blamed on a version difference.
+# Neither gpu.docker nor xpu.docker is set: the containers are created here.
+#
+#   python3 -m accuracy_agent.cli --config examples/vllm_commit_config.yaml
+
+backend: vllm
+
+model:
+  path: /mnt/weka/models/GLM-5.2-FP8
+
+vllm:
+  # Anything git resolves: full sha, short sha, tag, or branch. Fetched from
+  # origin automatically when the local clone does not have it yet.
+  commit: 7794b1e08bf505ff28664515ffaaeeec955ab796
+
+  # Local vllm-project/vllm clone used to resolve and export the commit.
+  # Defaults to ~/vllm, and is cloned into ~/.cache/accuracy_agent/vllm if
+  # there is none.
+  repo_path: /home/youruser/vllm
+
+  # Where the per-commit checkout goes. Keep it on the shared filesystem when
+  # the peers live on different hosts -- both must be able to see it.
+  build_root: /mnt/weka/accuracy_agent_builds
+
+  # false (default): CUDA kernels come from the nearest nightly wheel
+  #   (VLLM_USE_PRECOMPILED=1), so the build takes minutes. Right for bisecting
+  #   Python-level divergence, wrong if this commit touches C++/CUDA.
+  # true: compile the kernels at this commit -- 1-2 hours, cached afterwards.
+  build_kernels: false
+
+  # Ignore cached built images and install again.
+  rebuild: false
+
+gpu:
+  host: ""                 # empty = this machine
+  cards: "0"
+  # Base image for the built GPU peer. Defaults to the newest
+  # nvcr.io/nvidia/pytorch:NN.NN-py3 tag; pin it if that one does not build.
+  # base_image: nvcr.io/nvidia/pytorch:26.07-py3
+
+xpu:
+  host: ""
+  cards: "0"
+  # Defaults to the newest intel/intel-extension-for-pytorch:X.Y.Z-xpu tag.
+  # intel/deep-learning-essentials is the fallback if an IPEX build fails --
+  # it is what vLLM's own docker/Dockerfile.xpu uses.
+  # base_image: intel/deep-learning-essentials:2025.3.2-0-devel-ubuntu24.04
+  #
+  # Intel GPUs usually need the render group inside the container:
+  # docker_run_args: "--group-add 110"
+
+shared_fs: /mnt/weka
+output_dir: /mnt/weka/accuracy_debug_output
+
+test:
+  select: auto
+  prompt: "What is the capital of France?"
