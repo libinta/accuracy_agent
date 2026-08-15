@@ -63,13 +63,13 @@ class Bisector:
         # comparison. Instead we extract XPU hidden states alone (the "small
         # steps for big model" capture phase) and save them for a later
         # comparison once a GPU peer is available.
-        self.xpu_only = not (config.gpu_host or config.gpu_docker)
+        self.dut_only = not (config.gpu_host or config.gpu_docker)
 
         # Use backends if backend is specified
         if config.backend != "pytorch":
             self.use_backends = True
             self.gpu_backend = None
-            self.xpu_backend = None
+            self.dut_backend = None
         else:
             # Backward compatibility: use old RemoteExecutor
             self.use_backends = False
@@ -80,7 +80,7 @@ class Bisector:
         Setup GPU and XPU backends in parallel.
 
         Returns:
-            Tuple of (gpu_backend, xpu_backend)
+            Tuple of (gpu_backend, dut_backend)
         """
         # Create backend configs
         gpu_config = BackendConfig(
@@ -93,14 +93,14 @@ class Bisector:
             ssh_key_path=self.config.gpu_ssh_key_path
         )
 
-        xpu_config = BackendConfig(
-            host=self.config.xpu_host,
-            docker=self.config.xpu_docker,
-            vllm_path=self.config.xpu_vllm_path,
-            cards=self.config.xpu_cards,
-            device_type="xpu",
-            user=self.config.xpu_user,
-            ssh_key_path=self.config.xpu_ssh_key_path
+        dut_config = BackendConfig(
+            host=self.config.dut_host,
+            docker=self.config.dut_docker,
+            vllm_path=self.config.dut_vllm_path,
+            cards=self.config.dut_cards,
+            device_type=self.config.dut_device_type,
+            user=self.config.dut_user,
+            ssh_key_path=self.config.dut_ssh_key_path
         )
 
         def setup_backend(config: BackendConfig, device_name: str):
@@ -119,19 +119,19 @@ class Bisector:
         # XPU-only mode: no GPU peer configured. Skip the GPU backend entirely
         # (on an XPU-only host a "cuda" backend has no device and would land on
         # a busy XPU card and fail) and set up only the XPU backend.
-        if self.xpu_only:
-            xpu_backend = setup_backend(xpu_config, "XPU")
-            return None, xpu_backend
+        if self.dut_only:
+            dut_backend = setup_backend(dut_config, "XPU")
+            return None, dut_backend
 
         # Run GPU and XPU setup in parallel
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
             gpu_future = executor.submit(setup_backend, gpu_config, "GPU")
-            xpu_future = executor.submit(setup_backend, xpu_config, "XPU")
+            dut_future = executor.submit(setup_backend, dut_config, "XPU")
 
             gpu_backend = gpu_future.result()
-            xpu_backend = xpu_future.result()
+            dut_backend = dut_future.result()
 
-        return gpu_backend, xpu_backend
+        return gpu_backend, dut_backend
 
     def _test_layer_range_parallel(
         self,
@@ -160,22 +160,22 @@ class Bisector:
                 layer_end,
                 prompt
             )
-            xpu_future = executor.submit(
-                self.xpu_backend.run_layer_range,
+            dut_future = executor.submit(
+                self.dut_backend.run_layer_range,
                 layer_start,
                 layer_end,
                 prompt
             )
 
             hidden_states_gpu = gpu_future.result()
-            hidden_states_xpu = xpu_future.result()
+            hidden_states_dut = dut_future.result()
 
         # Compare tensors
-        result = compare_tensors(hidden_states_gpu, hidden_states_xpu)
+        result = compare_tensors(hidden_states_gpu, hidden_states_dut)
 
         return result
 
-    def _extract_xpu_only(
+    def _extract_dut_only(
         self,
         layer_start: int,
         layer_end: int
@@ -187,20 +187,41 @@ class Bisector:
         ``output_dir`` (so they survive for a later GPU-vs-XPU comparison), and
         returns a BisectionResult flagged as extraction-only.
         """
-        print(f"XPU-only extraction of layers [{layer_start}, {layer_end}) "
-              f"(no GPU peer configured)...")
+        print(f"{self.config.dut_device_type.upper()}-only extraction of layers "
+              f"[{layer_start}, {layer_end}) (no GPU peer configured)...")
 
-        hidden_states = self.xpu_backend.run_layer_range(
+        hidden_states = self.dut_backend.run_layer_range(
             layer_start, layer_end, self.config.test_prompt
         )
 
+        # Label the file with the ACTUAL device under test (xpu/hpu), not a
+        # hardcoded "xpu": a Gaudi run must produce hidden_states_hpu_*.pt so a
+        # later GPU-vs-device comparison does not mislabel the tensor's origin.
+        device = self.config.dut_device_type
         out_dir = Path(self.config.output_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
-        out_path = out_dir / f"hidden_states_xpu_{layer_start}_{layer_end}.pt"
+        out_path = out_dir / f"hidden_states_{device}_{layer_start}_{layer_end}.pt"
         torch.save(hidden_states, out_path)
 
+        # The backend also wrote a per-layer companion (".alllayers", a
+        # {layer_idx: tensor} dict) next to its own output on shared_fs. Bring it
+        # into output_dir alongside the summary tensor so finer-grained
+        # bisection can find it in one place (it otherwise lives only under
+        # shared_fs with a possibly different device label). Best-effort.
+        try:
+            src_alllayers = (
+                Path(self.dut_backend.shared_fs)
+                / f"hidden_states_{device}_{layer_start}_{layer_end}.pt.alllayers"
+            )
+            if src_alllayers.exists():
+                dst_alllayers = Path(str(out_path) + ".alllayers")
+                if src_alllayers.resolve() != dst_alllayers.resolve():
+                    dst_alllayers.write_bytes(src_alllayers.read_bytes())
+        except Exception as e:  # non-fatal: summary tensor is already saved
+            print(f"  (note: could not copy per-layer companion: {e})")
+
         report = (
-            f"XPU hidden states for layers [{layer_start}, {layer_end}) "
+            f"{device.upper()} hidden states for layers [{layer_start}, {layer_end}) "
             f"extracted to {out_path} (shape {tuple(hidden_states.shape)}). "
             f"No GPU peer configured, so no comparison was performed."
         )
@@ -237,11 +258,11 @@ class Bisector:
         """
         try:
             if self.use_backends:
-                needs_setup = self.xpu_backend is None or (
-                    not self.xpu_only and self.gpu_backend is None
+                needs_setup = self.dut_backend is None or (
+                    not self.dut_only and self.gpu_backend is None
                 )
                 if needs_setup:
-                    self.gpu_backend, self.xpu_backend = self._parallel_setup()
+                    self.gpu_backend, self.dut_backend = self._parallel_setup()
 
             labels = [f"{name}@{idx}" for name, idx in layer_groups]
             print(f"\n{'='*60}")
@@ -250,10 +271,10 @@ class Bisector:
 
             # XPU-only mode has no GPU peer -- fall back to extracting each
             # representative layer's hidden states without comparison.
-            if self.use_backends and self.xpu_only:
+            if self.use_backends and self.dut_only:
                 last = None
                 for _name, idx in layer_groups:
-                    last = self._extract_xpu_only(idx, idx + 1)
+                    last = self._extract_dut_only(idx, idx + 1)
                 return last
 
             results: List[ComparisonResult] = []
@@ -291,8 +312,8 @@ class Bisector:
             if self.use_backends:
                 if self.gpu_backend is not None:
                     self.gpu_backend.cleanup()
-                if self.xpu_backend is not None:
-                    self.xpu_backend.cleanup()
+                if self.dut_backend is not None:
+                    self.dut_backend.cleanup()
 
     def bisect_layers(
         self,
@@ -312,19 +333,19 @@ class Bisector:
             # Setup backends if using new backend system. In XPU-only mode the
             # GPU backend is intentionally None, so gate setup on the XPU one.
             if self.use_backends:
-                needs_setup = self.xpu_backend is None or (
-                    not self.xpu_only and self.gpu_backend is None
+                needs_setup = self.dut_backend is None or (
+                    not self.dut_only and self.gpu_backend is None
                 )
                 if needs_setup:
-                    self.gpu_backend, self.xpu_backend = self._parallel_setup()
+                    self.gpu_backend, self.dut_backend = self._parallel_setup()
 
             print(f"\n{'='*60}")
             print(f"Bisecting layers {layer_start}-{layer_end}")
             print(f"{'='*60}\n")
 
             # XPU-only extraction: capture XPU hidden states, no comparison.
-            if self.use_backends and self.xpu_only:
-                return self._extract_xpu_only(layer_start, layer_end)
+            if self.use_backends and self.dut_only:
+                return self._extract_dut_only(layer_start, layer_end)
 
             # Use parallel execution if backends available
             if self.use_backends:
@@ -380,8 +401,8 @@ class Bisector:
             if self.use_backends:
                 if self.gpu_backend is not None:
                     self.gpu_backend.cleanup()
-                if self.xpu_backend is not None:
-                    self.xpu_backend.cleanup()
+                if self.dut_backend is not None:
+                    self.dut_backend.cleanup()
 
     def _test_layer_range(
         self,
@@ -403,46 +424,46 @@ class Bisector:
         gpu_script = generate_test_harness(
             self.config, self.model_info, layer_start, layer_end, "gpu"
         )
-        xpu_script = generate_test_harness(
+        dut_script = generate_test_harness(
             self.config, self.model_info, layer_start, layer_end, "xpu"
         )
 
         # Save scripts to shared FS
         gpu_script_path = f"{self.config.output_dir}/test_gpu_{layer_start}_{layer_end}.py"
-        xpu_script_path = f"{self.config.output_dir}/test_xpu_{layer_start}_{layer_end}.py"
+        dut_script_path = f"{self.config.output_dir}/test_xpu_{layer_start}_{layer_end}.py"
 
         save_test_harness(gpu_script, gpu_script_path)
-        save_test_harness(xpu_script, xpu_script_path)
+        save_test_harness(dut_script, dut_script_path)
 
         # Output paths
         gpu_output_path = f"{self.config.output_dir}/layer_{layer_start}_{layer_end}_gpu.pt"
-        xpu_output_path = f"{self.config.output_dir}/layer_{layer_start}_{layer_end}_xpu.pt"
+        dut_output_path = f"{self.config.output_dir}/layer_{layer_start}_{layer_end}_xpu.pt"
 
         # Execute on both platforms
         gpu_result = self.executor.execute_test_script(
             gpu_script_path, gpu_output_path, "gpu"
         )
 
-        xpu_result = self.executor.execute_test_script(
-            xpu_script_path, xpu_output_path, "xpu"
+        dut_result = self.executor.execute_test_script(
+            dut_script_path, dut_output_path, "xpu"
         )
 
         # Check execution success
         if not gpu_result.success:
             raise RuntimeError(f"GPU execution failed: {gpu_result.stderr}")
 
-        if not xpu_result.success:
-            raise RuntimeError(f"XPU execution failed: {xpu_result.stderr}")
+        if not dut_result.success:
+            raise RuntimeError(f"DUT execution failed: {dut_result.stderr}")
 
         # Load outputs from shared FS
         gpu_data = torch.load(gpu_output_path)
-        xpu_data = torch.load(xpu_output_path)
+        dut_data = torch.load(dut_output_path)
 
         # Compare the intermediate hidden states produced by this layer range.
         # The harness saves hidden states (not final-model logits) so that each
         # layer range yields a distinct, isolatable output for bisection.
         gpu_tensor = _extract_compare_tensor(gpu_data)
-        xpu_tensor = _extract_compare_tensor(xpu_data)
-        comparison = compare_tensors(gpu_tensor, xpu_tensor)
+        dut_tensor = _extract_compare_tensor(dut_data)
+        comparison = compare_tensors(gpu_tensor, dut_tensor)
 
         return comparison

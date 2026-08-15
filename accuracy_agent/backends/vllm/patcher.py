@@ -1,5 +1,6 @@
 """Auto-patch vLLM source to enable layer extraction via SSH"""
 
+import os
 import paramiko
 import subprocess
 import socket
@@ -7,10 +8,16 @@ import base64
 from pathlib import Path
 from typing import Optional, Callable
 import logging
-from .patches.models import ModelPatchProvider, GLMPatchProvider, GLM52PatchProvider
+from .patches.models import ModelPatchProvider, GLMPatchProvider, GLM52PatchProvider, Qwen3MoePatchProvider
 from .patches.models.base import ModelPatchProvider as BaseModelPatchProvider
 
 logger = logging.getLogger(__name__)
+
+# Local-exec timeout for a single `exec_in_docker` call. The model-load +
+# forward for a large FP8 MoE (dozens of shards) can exceed the old hard-coded
+# 300s, which would silently return a "timed out" stderr and abort the run.
+# Default to 30 min; override with ACCURACY_EXEC_TIMEOUT (seconds).
+_EXEC_TIMEOUT = int(os.environ.get("ACCURACY_EXEC_TIMEOUT", "1800"))
 
 
 class VLLMPatcher:
@@ -75,6 +82,11 @@ class VLLMPatcher:
             else:
                 logger.info("Detected GLM model (generic)")
                 return GLMPatchProvider()
+
+        # Qwen models (Qwen3-MoE: Qwen3-*-A*B, Qwen3.5/3.6 MoE, etc.)
+        if 'qwen' in model_name_lower:
+            logger.info("Detected Qwen model (Qwen3-MoE)")
+            return Qwen3MoePatchProvider()
 
         # TODO: Add more model types here as needed
         # elif 'llama' in model_name_lower:
@@ -206,11 +218,11 @@ class VLLMPatcher:
                     ["bash", "-c", cmd],
                     capture_output=True,
                     text=True,
-                    timeout=300
+                    timeout=_EXEC_TIMEOUT
                 )
                 return result.stdout, result.stderr
             except subprocess.TimeoutExpired:
-                return "", "Command timed out after 300s"
+                return "", f"Command timed out after {_EXEC_TIMEOUT}s"
             except Exception as e:
                 return "", f"Local execution failed: {e}"
 

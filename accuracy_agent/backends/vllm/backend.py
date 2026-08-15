@@ -125,6 +125,9 @@ class VLLMBackend(Backend):
             affinity_env = f"ZE_AFFINITY_MASK={cards} "
         elif self.config.device_type == "cuda":
             affinity_env = f"CUDA_VISIBLE_DEVICES={cards} "
+        elif self.config.device_type == "hpu":
+            # Gaudi (Habana) selects visible accelerators via module IDs.
+            affinity_env = f"HABANA_VISIBLE_MODULES={cards} "
         else:
             affinity_env = ""
 
@@ -150,8 +153,14 @@ class VLLMBackend(Backend):
         # Execute in docker
         stdout, stderr = self.patcher.exec_in_docker(cmd)
 
-        # Check for errors (case-insensitive)
-        if stderr and "error" in stderr.lower():
+        # Only treat EXPLICIT failure signals as fatal here. A bare
+        # "error" substring is too broad: HPU emits benign warnings
+        # ("... does not have any effect"), vLLM logs can say "0 errors", and
+        # the FP8-GEMM/sparse-MLA fixes intentionally log "Could not apply ...".
+        # debug_runner.main() prints an "ERROR:" line + a traceback on real
+        # failure, so key off those. Final success is still gated on the output
+        # file existing below (so a missed signal cannot pass silently).
+        if stderr and ("ERROR:" in stderr or "Traceback (most recent call last)" in stderr):
             raise RuntimeError(f"vLLM execution failed: {stderr}")
 
         # A remote backend wrote output_path onto ITS filesystem, which the two

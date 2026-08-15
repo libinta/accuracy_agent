@@ -88,8 +88,8 @@ class RemoteExecutor:
             host = self.config.gpu_host
             container = self.config.gpu_docker
         elif platform == "xpu":
-            host = self.config.xpu_host
-            container = self.config.xpu_docker
+            host = self.config.dut_host
+            container = self.config.dut_docker
         else:
             raise ValueError(f"Invalid platform: {platform}")
 

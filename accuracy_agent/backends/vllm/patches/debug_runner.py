@@ -38,6 +38,8 @@ def _set_device_affinity_from_argv() -> None:
             os.environ["ZE_AFFINITY_MASK"] = cards
         elif device == "cuda":
             os.environ["CUDA_VISIBLE_DEVICES"] = cards
+        elif device == "hpu":
+            os.environ["HABANA_VISIBLE_MODULES"] = cards
 
 
 _set_device_affinity_from_argv()
@@ -91,6 +93,8 @@ def run_partial_layers(
         os.environ["CUDA_VISIBLE_DEVICES"] = cards
     elif device == "xpu":
         os.environ["ZE_AFFINITY_MASK"] = cards
+    elif device == "hpu":
+        os.environ["HABANA_VISIBLE_MODULES"] = cards
 
     # Clamp layer construction to the requested window so only these layers
     # allocate weight tensors (read by our patched make_layers() in utils.py).
@@ -99,6 +103,13 @@ def run_partial_layers(
     # vLLM so the value is inherited by the EngineCore subprocess.
     os.environ["ACCURACY_DEBUG_LAYER_START"] = "0"
     os.environ["ACCURACY_DEBUG_LAYER_END"] = str(layer_end)
+
+    # Gaudi/HPU: skip shape-bucket warmup. Warmup compiles many buckets and, for
+    # dynamic MoE, reserves/fragments device HBM -- which starves the FP8
+    # mixture_of_experts op and triggers "No enough memory for defragment". The
+    # debug forward is a single fixed shape, so warmup is pure overhead here.
+    if device == "hpu":
+        os.environ.setdefault("VLLM_SKIP_WARMUP", "true")
 
     # vLLM v1 runs the model inside a separate EngineCore process by default
     # (SyncMPClient), which makes the in-memory model object unreachable from
@@ -113,14 +124,21 @@ def run_partial_layers(
     # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
 
-    # Inject debug config before model loading
-    # This is read by our patches in default_loader.py and llama.py
+    # Inject debug config before model loading.
+    # NOTE: the PRIMARY layer-window mechanism is the env vars
+    # ACCURACY_DEBUG_LAYER_START/END set above -- both the shared make_layers()
+    # clamp and the default_loader weight filter read only those. These
+    # hf_config.debug_layer_* attributes are a SECONDARY path consumed solely by
+    # model-file layer-init patches that still read `config.debug_layer_*`
+    # (e.g. GLM's get_layer_init_patch). The Qwen3.5 provider is a no-op there,
+    # so for Qwen these attrs are set but unused -- harmless and kept for GLM.
     import vllm.config
     original_model_config_init = vllm.config.ModelConfig.__init__
 
     def patched_init(self: "vllm.config.ModelConfig", *args, **kwargs) -> None:  # type: ignore
         original_model_config_init(self, *args, **kwargs)
-        # Inject debug flags
+        # Inject debug flags (see NOTE above: consumed only by GLM-style
+        # model-file layer-init patches, not by the env-based primary path).
         if load_mode == "partial_layers":
             self.hf_config.debug_layer_start = layer_start
             self.hf_config.debug_layer_end = layer_end
@@ -136,15 +154,23 @@ def run_partial_layers(
 
     vllm.config.ModelConfig.__init__ = patched_init
 
+    # Fraction of card memory vLLM is allowed to pre-reserve. Keep this SMALL on
+    # HPU: the FP8 mixture_of_experts op needs a large *contiguous* HBM
+    # workspace at runtime, and a big pre-reservation fragments the pool enough
+    # to trip "No enough memory for defragment". 0.4 is a safe default for the
+    # few-layer debug window; override via ACCURACY_GPU_MEM_UTIL for a different
+    # card/model (e.g. lower to 0.3 if the MoE op still OOMs, raise if KV-cache
+    # block allocation fails the startup check).
+    gpu_mem_util = float(os.environ.get("ACCURACY_GPU_MEM_UTIL", "0.4"))
+
     # Load model with vLLM
-    print(f"Loading model from {model_path} with mode={load_mode}, tensor_parallel_size={num_cards}")
+    print(f"Loading model from {model_path} with mode={load_mode}, "
+          f"tensor_parallel_size={num_cards}, gpu_memory_utilization={gpu_mem_util}")
     llm = LLM(
         model=model_path,
         trust_remote_code=True,
         enforce_eager=True,
-        gpu_memory_utilization=0.8,  # Weights (debug window is a few layers) are
-        # small; use most of the *free* card (shared card: ~26/30 GiB free, so
-        # 0.9 trips the startup check) so KV-cache blocks can be allocated.
+        gpu_memory_utilization=gpu_mem_util,
         tensor_parallel_size=num_cards,
         max_model_len=2048,  # Small ctx: shrinks KV-cache + profiling peak
         max_num_seqs=1,  # Single-seq profiling → smaller dummy-run peak
@@ -185,11 +211,38 @@ def run_partial_layers(
 
     model = _resolve_model(llm.llm_engine)
 
-    # Locate the decoder layer list regardless of wrapper depth.
-    if hasattr(model, 'model'):
-        layers = model.model.layers
-    else:
-        layers = model.layers
+    # Locate the decoder layer ModuleList regardless of wrapper depth. Different
+    # architectures nest it differently:
+    #   plain decoder:    model.model.layers  /  model.layers
+    #   multimodal (VL):  model.language_model.model.layers
+    # Try the known paths first, then fall back to the longest nn.ModuleList
+    # named "layers" (the decoder stack; vision towers use "blocks").
+    def _resolve_layers(root):
+        import torch.nn as _nn
+        for path in ("model.layers", "language_model.model.layers",
+                     "language_model.layers", "layers"):
+            obj, ok = root, True
+            for attr in path.split("."):
+                if hasattr(obj, attr):
+                    obj = getattr(obj, attr)
+                else:
+                    ok = False
+                    break
+            if ok and isinstance(obj, _nn.ModuleList) and len(obj) > 0:
+                return obj
+        best = None
+        for name, module in root.named_modules():
+            if (isinstance(module, _nn.ModuleList)
+                    and name.split(".")[-1] == "layers" and len(module) > 0):
+                if best is None or len(module) > len(best):
+                    best = module
+        if best is None:
+            raise AttributeError(
+                "Could not locate decoder layer ModuleList on "
+                f"{type(root).__name__}")
+        return best
+
+    layers = _resolve_layers(model)
 
     # Capture hidden states via forward HOOKS during a real engine forward.
     # Manually calling a DeepseekV2DecoderLayer outside the engine fails: MLA
@@ -204,10 +257,18 @@ def run_partial_layers(
             # Decoder layers return (hidden_states, residual). The post-layer
             # hidden state is hidden_states + residual (the next layer's
             # input_layernorm / final norm consumes their sum), so store that.
+            # In hybrid models the linear_attention and full_attention layers
+            # may not share this exact convention, so only add residual when it
+            # is a real tensor of matching shape; otherwise fall back to the
+            # first output element (never crash the capture on an odd layer).
             if isinstance(output, tuple):
                 hs = output[0]
                 res = output[1] if len(output) > 1 else None
-                combined = hs + res if res is not None else hs
+                if (res is not None and hasattr(res, "shape")
+                        and getattr(hs, "shape", None) == res.shape):
+                    combined = hs + res
+                else:
+                    combined = hs
             else:
                 combined = output
             captured[abs_idx] = combined.detach().to(torch.float32).cpu()
@@ -340,7 +401,7 @@ def main() -> None:
     parser.add_argument("--output", type=str, required=True,
                       help="Output path for hidden states tensor")
     parser.add_argument("--device", type=str, default="cuda",
-                      choices=["cuda", "xpu"],
+                      choices=["cuda", "xpu", "hpu"],
                       help="Device type")
     parser.add_argument("--cards", type=str, default="0",
                       help="Device card IDs (comma-separated)")

@@ -122,7 +122,13 @@ def load_model_config(model_path: str) -> Dict[str, Any]:
         raise FileNotFoundError(f"Config not found: {config_path}")
 
     with open(config_path) as f:
-        return json.load(f)
+        config = json.load(f)
+
+    # Multimodal configs nest language-model fields under "text_config"; merge
+    # them up so memory estimation can read num_hidden_layers/hidden_size/etc.
+    if isinstance(config.get("text_config"), dict):
+        config = {**config, **config["text_config"]}
+    return config
 
 
 def query_available_memory(host: str, docker: str, device_type: str, patcher) -> float:
@@ -143,6 +149,9 @@ def query_available_memory(host: str, docker: str, device_type: str, patcher) ->
     elif device_type == "xpu":
         # XPU memory query (get first available card)
         cmd = "xpu-smi dump -m 2>/dev/null | grep 'GPU Memory Available' | head -1 | awk '{print $4}'"
+    elif device_type == "hpu":
+        # Gaudi (Habana) memory query via hl-smi; returns free memory in MiB.
+        cmd = "hl-smi --query-aip=memory.free --format=csv,noheader,nounits | head -1"
     else:
         raise ValueError(f"Unknown device type: {device_type}")
 

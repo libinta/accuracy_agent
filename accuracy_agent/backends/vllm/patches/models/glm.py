@@ -46,6 +46,17 @@ class GLMPatchProvider(ModelPatchProvider):
 def _filter_layer_weights(param_name: str, layer_start: int, layer_end: int) -> bool:
     '''Return True if weight should be loaded, False to skip'''
     import re
+    import os as _aa_os2
+    # Optional: skip the vision tower entirely (multimodal VL models). Its
+    # params (visual.* / vision_tower.* / vision_model.*) are NOT named
+    # layers.{i}, so the layer-range filter below always keeps them, leaving the
+    # whole vision encoder resident in HBM even for a text-only hidden-state
+    # extraction. Off by default (dropping weights vLLM's loader expects can
+    # raise a missing-weight error); enable with ACCURACY_SKIP_VISION=1 when the
+    # decoder MoE op needs the extra contiguous HBM.
+    if _aa_os2.environ.get('ACCURACY_SKIP_VISION') in ('1', 'true', 'True'):
+        if re.match(r'(model\\.)?(visual|vision_tower|vision_model)\\.', param_name):
+            return False
     # Pattern for GLM layer weights: model.layers.{i}.*
     match = re.search(r'layers\\.(\\d+)\\.', param_name)
     if match:
@@ -54,15 +65,19 @@ def _filter_layer_weights(param_name: str, layer_start: int, layer_end: int) -> 
     # Always load non-layer weights (embed_tokens, lm_head, etc.)
     return True
 
-# Wrap weights iterator with layer filter if debug mode is enabled
+# Wrap weights iterator with layer filter if debug mode is enabled.
+# Activation is via env vars (set by debug_runner before vLLM import and
+# inherited by the in-process EngineCore). We avoid model_loader_extra_config
+# because newer vLLM strictly whitelists its keys and rejects unknown ones.
+import os as _aa_os
 original_iterator = ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
-if hasattr(self.load_config, 'model_loader_extra_config'):
-    extra_config = self.load_config.model_loader_extra_config or {}
-    if 'debug_layer_start' in extra_config and 'debug_layer_end' in extra_config:
-        layer_start = extra_config['debug_layer_start']
-        layer_end = extra_config['debug_layer_end']
-        return ((name, tensor) for (name, tensor) in original_iterator
-                if _filter_layer_weights(name, layer_start, layer_end))
+_aa_start = _aa_os.environ.get('ACCURACY_DEBUG_LAYER_START')
+_aa_end = _aa_os.environ.get('ACCURACY_DEBUG_LAYER_END')
+if _aa_start is not None and _aa_end is not None:
+    layer_start = int(_aa_start)
+    layer_end = int(_aa_end)
+    return ((name, tensor) for (name, tensor) in original_iterator
+            if _filter_layer_weights(name, layer_start, layer_end))
 
 return original_iterator
 # === ACCURACY_AGENT PATCH END ===
