@@ -1,14 +1,24 @@
 # GPU/XPU accuracy testing with the GPU side configured automatically.
 #
 # There is no `gpu:` section at all: because the XPU docker runs on this machine,
-# the tool reads the vLLM version out of the XPU container, picks the matching
-# vllm/vllm-openai RELEASE image (never a nightly), and starts a container from
-# it -- so both sides run the same vLLM version without anyone looking it up.
+# the tool asks that container which vLLM COMMIT it is running, then installs
+# exactly that commit into the NVIDIA PyTorch image (nvcr.io/nvidia/pytorch) and
+# uses the result as the GPU peer -- so both sides run the same vLLM code and a
+# divergence cannot be blamed on a version difference.
 #
 #   $ python3 -m accuracy_agent.cli --config examples/local_xpu_auto_gpu.yaml
-#   Matching GPU docker image to the XPU vLLM version...
-#   ✓ XPU vLLM 0.26.1rc1.dev353+g7794b1e08.xpu -> vllm/vllm-openai:v0.26.0 \
-#     (nearest release) container=accuracy_agent_gpu_v0.26.0
+#   Reading the vLLM commit out of the XPU docker and building a matching CUDA peer...
+#   ✓ XPU container runs vLLM @ 7794b1e08bf505ff28664515ffaaeeec955ab796 \
+#     [git checkout /workspace/vllm]
+#   ✓ cuda: vLLM @ 7794b1e08bf5 built on nvcr.io/nvidia/pytorch:26.07-py3 \
+#     (kernels from nearest nightly wheel, not this commit) \
+#     -> accuracy_agent_vllm_cuda_7794b1e08bf5
+#
+# The commit is resolved in a local vllm-project/vllm clone (~/vllm by default,
+# `vllm.repo_path` to point elsewhere) and fetched from origin if the clone does
+# not have it. CUDA kernels come from the nearest nightly wheel by default, which
+# takes minutes; add `--build-kernels` (1-2 h) when the commit touches C++/CUDA.
+# The built image is cached, so later runs with the same commit start in seconds.
 #
 # Requirements: a docker CLI and an NVIDIA GPU on this machine (otherwise the
 # automation stays out of the way and the run falls back to XPU-only
@@ -33,8 +43,16 @@ xpu:
 # automation picks, e.g.:
 # gpu:
 #   cards: "0"                       # which GPU(s) to run on (default "0")
-#   image: vllm/vllm-openai:v0.26.0  # pin the image instead of matching versions
+#   base_image: nvcr.io/nvidia/pytorch:26.07-py3  # pin the base the peer is built on
+#   image: my-registry/vllm:my-build # ready-made image: no detection, no build
 #   auto_image: false                # disable the automation completely
+
+# Where the detected commit is checked out and how it is built. All optional.
+# vllm:
+#   repo_path: /home/youruser/vllm         # clone to resolve the commit in
+#   build_root: /mnt/weka/accuracy_agent_builds
+#   build_kernels: false                   # true = compile CUDA kernels (1-2 h)
+#   rebuild: false                         # ignore the cached built image
 
 shared_fs: /mnt/weka                 # bind-mounted into the auto-launched container
 output_dir: /mnt/weka/accuracy_debug_auto_gpu

@@ -29,25 +29,33 @@ cp examples/glm52_vllm_config_template.yaml examples/my_config.yaml
 python3 -m accuracy_agent.cli --config examples/my_config.yaml
 ```
 
-### Automatic GPU Docker Selection
+### Automatic GPU Peer From the XPU Container's Commit
 
 **File:** `local_xpu_auto_gpu.yaml`
 
 A GPU-vs-XPU comparison is only meaningful when both sides run the **same vLLM
-version** -- otherwise a "divergence" may just be a version difference. When the
-XPU docker runs on the same machine as the tool, you no longer have to look that
-version up: leave `gpu.docker` unset and the tool will
+code** -- otherwise a "divergence" may just be a version difference. When the XPU
+docker runs on the same machine as the tool, you do not have to build that peer
+yourself: leave `gpu.docker` unset and the tool will
 
-1. query the XPU container for its vLLM version
-   (e.g. `0.26.1rc1.dev353+g7794b1e08.xpu`),
-2. reduce it to a released version and pick the matching `vllm/vllm-openai`
-   **release** tag -- nightly and dev tags are never candidates. A dev/rc build
-   predates its own version number, so it maps to the closest *published*
-   release (`0.26.1rc1.dev…` -> `v0.26.0`). Tags are verified against Docker Hub
-   when reachable, and constructed from the version offline otherwise,
-3. `docker pull` that image and start an idle container from it (reusing it on
-   later runs), and
-4. detect the vLLM path inside it, so patching works with no further config.
+1. ask the XPU container which **exact commit** its vLLM is. Two sources, most
+   exact first: the git checkout vLLM is imported from (`git rev-parse HEAD`, a
+   full sha, plus whether that tree has uncommitted changes), and otherwise the
+   `+g<sha>` part that setuptools-scm stamps into every dev build (the
+   `g7794b1e08` of `0.26.1rc1.dev353+g7794b1e08.xpu` -- the same thing vLLM's own
+   `collect_env` reports as its git sha),
+2. resolve that commit in a local `vllm-project/vllm` clone (`~/vllm` by default,
+   `vllm.repo_path` to override), fetching it from `origin` if needed, and export
+   it to a per-commit checkout,
+3. install it **editable** into the newest `nvcr.io/nvidia/pytorch:NN.NN-py3`
+   image -- the same base and the same install as the `vllm.commit` mode below --
+   and `docker commit` the result to `accuracy_agent/vllm:cuda-<sha12>`, so later
+   runs with that commit start in seconds,
+4. use that container as the GPU peer, with the vLLM path detected inside it, so
+   patching works with no further config.
+
+The XPU container itself is never touched or rebuilt: it is the subject of the
+comparison, and the GPU peer is built to match it.
 
 ```bash
 python3 -m accuracy_agent.cli --config examples/local_xpu_auto_gpu.yaml
@@ -56,31 +64,55 @@ python3 -m accuracy_agent.cli --backend vllm \
   --model /mnt/weka/models/GLM-5.2-FP8 --xpu-docker your_xpu_container
 ```
 
+CUDA kernels come from the nearest nightly wheel by default (minutes); add
+`--build-kernels` to compile them at that commit (1-2 h) when it touches
+C++/CUDA. Every report says which of the two produced the peer. The `vllm.*`
+build settings in the table further down apply to this mode too.
+
 Controls (`gpu:` section, or CLI):
 
 | Setting | CLI | Effect |
 |---|---|---|
 | `gpu.docker` | `--gpu-docker` | Explicit container; always wins, no automation |
-| `gpu.image` | `--gpu-image` | Pin the image, skip version matching |
+| `gpu.image` | `--gpu-image` | Ready-made image: no commit detection, no build |
+| `gpu.base_image` | `--gpu-base-image` | Pin the CUDA base the peer is built on |
 | `gpu.auto_image: false` | `--no-auto-gpu-image` | Disable the automation |
-| `gpu.container_name` | -- | Name for the auto-launched container (default `accuracy_agent_gpu_<tag>`) |
+| `gpu.container_name` | -- | Name for the built container (default `accuracy_agent_vllm_cuda_<sha12>`) |
 | `gpu.docker_run_args` | -- | Extra raw `docker run` flags |
 
 The automation skips itself (logging why, run continues) when the XPU docker is
 on a remote host, when there is no docker CLI, or when the machine has no NVIDIA
-GPU -- an XPU-only box keeps doing XPU-only extraction as before.
+GPU -- an XPU-only box keeps doing XPU-only extraction as before. It fails with a
+clear message (and leaves the run XPU-only) when the XPU container records **no**
+commit at all -- a plain release wheel does not -- or when its commit is not a
+commit of `vllm-project/vllm`, e.g. a fork. In both cases `--vllm-commit` builds
+both sides from a commit you name, and `--gpu-docker`/`--gpu-image` hands the GPU
+side over to you.
 
-The launched container is left running so repeated runs skip the multi-GB pull.
-Remove it with `docker rm -f accuracy_agent_gpu_<tag>`.
+The built container is left running so repeated runs skip the install. Remove it
+with `docker rm -f accuracy_agent_vllm_cuda_<sha12>`, and drop the cached image
+with `docker rmi accuracy_agent/vllm:cuda-<sha12>`. A failed install also leaves
+its container behind on purpose, so it can be inspected; the next run notices it
+has no vLLM in it, removes it and installs again, so there is nothing to clean up
+by hand.
+
+The per-commit checkout under `vllm.build_root` collects build artifacts written
+by the container's **root**, so your own user cannot delete it afterwards. Remove
+it as root, e.g.
+
+```bash
+docker run --rm -v <build_root>:/t --entrypoint /bin/bash \
+  nvcr.io/nvidia/pytorch:26.07-py3 -c 'rm -rf /t/vllm-<sha12>'
+```
 
 ### Testing One vLLM Commit on Both Devices
 
 **File:** `vllm_commit_config.yaml`
 
-Release matching answers "compare against the closest release". To ask "does
-commit `<sha>` diverge?" there is no release image to match, so `vllm.commit`
-builds both peers from that commit instead -- installed from source into the two
-vendors' PyTorch images, so the peers differ only in device:
+The mode above compares whatever the XPU container happens to run. To ask "does
+commit `<sha>` diverge?", name it: `vllm.commit` builds **both** peers from that
+commit -- installed from source into the two vendors' PyTorch images, so the peers
+differ only in device:
 
 ```bash
 python3 -m accuracy_agent.cli --backend vllm \

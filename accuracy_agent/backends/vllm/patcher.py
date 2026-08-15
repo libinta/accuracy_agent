@@ -104,7 +104,7 @@ class VLLMPatcher:
 
     def _is_local_host(self) -> bool:
         """True if `host` names this machine (so the docker CLI is reachable)."""
-        from accuracy_agent.gpu_image_resolver import is_local_host
+        from accuracy_agent.docker_probe import is_local_host
 
         return is_local_host(self.host)
 

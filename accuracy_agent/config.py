@@ -27,11 +27,12 @@ class DebugConfig:
     gpu_ssh_key_path: Optional[str] = None
 
     # GPU docker image handling. When gpu_docker is empty and the XPU docker is
-    # reachable locally, gpu_auto_image lets the tool read the vLLM version out
-    # of the XPU container and start a matching vllm/vllm-openai RELEASE image
-    # itself (see gpu_image_resolver), so the GPU side needs no configuration.
-    gpu_image: str = ""              # explicit image ref; skips version matching
-    gpu_auto_image: bool = True      # resolve+launch GPU docker automatically
+    # reachable locally, gpu_auto_image lets the tool read the exact vLLM COMMIT
+    # out of the XPU container and build that commit into the NVIDIA PyTorch base
+    # image itself (see vllm_source_builder.autoconfigure_gpu_from_xpu_commit),
+    # so the GPU side needs no configuration and runs the same vLLM code.
+    gpu_image: str = ""              # explicit image ref; skips detection and building
+    gpu_auto_image: bool = True      # derive+launch the GPU docker automatically
     gpu_container_name: str = ""     # name for the auto-launched container
     gpu_docker_run_args: str = ""    # extra raw `docker run` flags
     # None = auto-detect whether we run inside the target container; set to False
@@ -49,9 +50,11 @@ class DebugConfig:
     xpu_docker_run_args: str = ""
 
     # Build both peers from one vllm-project/vllm commit (see vllm_source_builder).
-    # When vllm_commit is set it replaces release-image matching: the commit is
-    # installed from source into the vendor PyTorch base images below, so both
-    # sides run identical vLLM code.
+    # Set vllm_commit to compare a KNOWN commit: it is installed from source into
+    # the vendor PyTorch base images below, so both sides run identical vLLM code.
+    # Left empty, the commit is instead read out of the existing XPU container and
+    # only the GPU peer is built from it; the settings below apply to that build
+    # too, and vllm_commit is filled in with the commit that was detected.
     vllm_commit: str = ""            # sha / tag / branch in vllm-project/vllm
     vllm_repo_path: str = ""         # local clone to resolve it in (default: ~/vllm)
     vllm_build_root: str = ""        # where per-commit checkouts go

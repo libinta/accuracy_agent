@@ -1,13 +1,22 @@
-"""Build both comparison peers from one vllm-project/vllm commit.
+"""Build comparison peers from one vllm-project/vllm commit.
 
-Version matching (see ``gpu_image_resolver``) pairs a prebuilt
-``vllm/vllm-openai`` release with whatever the XPU container happens to run.
-That answers "compare against the closest release", but it cannot answer "does
-commit <sha> diverge?": there is no release image per commit, and the two peers
-would still differ in base OS and build flags.
+Both peer setup modes end up here, because both need the same thing: a container
+running a KNOWN vLLM commit, installed from source into a vendor PyTorch image.
 
-This module takes the other route -- one commit, installed from source into the
-two vendors' PyTorch images, so both peers run identical vLLM Python code:
+  * ``vllm.commit`` set -- build BOTH peers from that commit
+    (``autoconfigure_from_commit``). Answers "does commit <sha> diverge?".
+  * ``vllm.commit`` unset, XPU container given -- ask that container which commit
+    it actually runs and build the CUDA peer from it
+    (``autoconfigure_gpu_from_xpu_commit``). Answers "does the vLLM my XPU
+    container runs diverge from the same code on CUDA?".
+
+The second mode used to pair the XPU container with the closest published
+``vllm/vllm-openai`` release instead. That was cheap but weak: a dev build maps
+to a release hundreds of commits away, so a "divergence" could just as well have
+been a version difference. Building the reported commit costs one install and
+removes that doubt entirely.
+
+The pipeline is the same either way:
 
   1. resolve the commit in a local vllm-project/vllm clone (fetching it from
      ``origin`` when the clone does not have it yet)
@@ -42,15 +51,18 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
 
-from accuracy_agent.gpu_image_resolver import (
+from accuracy_agent.docker_probe import (
     CommandRunner,
-    GPUImageResolution,
+    DockerProbeError,
+    VLLMCommit,
     _container_state,
+    detect_vllm_commit,
     detect_vllm_path,
     docker_available,
+    ensure_gpu_container,
     host_has_nvidia_gpu,
     is_local_host,
-    maybe_autoconfigure_gpu_docker,
+    running_inside_container,
 )
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -132,27 +144,47 @@ class VLLMBuild:
 
 
 @dataclass
+class GPUPeerFromXPU:
+    """A GPU peer derived from what the existing XPU container runs."""
+    xpu_commit: Optional[VLLMCommit] = None   # commit detected in the XPU container
+    commit: str = ""                          # full sha it resolved to upstream
+    build: Optional[VLLMBuild] = None         # the CUDA peer built from it
+    container: str = ""                       # container started from a pinned gpu.image
+    image: str = ""                           # that pinned image
+    note: str = ""
+
+
+@dataclass
 class PeerSetup:
     """What automatic peer configuration produced, for reporting."""
     commit: Optional[str] = None
     builds: Dict[str, VLLMBuild] = field(default_factory=dict)
-    image_resolution: Optional[GPUImageResolution] = None
+    xpu_commit: Optional[VLLMCommit] = None    # set when the commit came from the XPU peer
+    gpu_container: str = ""                    # set when a pinned gpu.image was launched
+    gpu_image: str = ""
+    notes: List[str] = field(default_factory=list)
     skipped: List[str] = field(default_factory=list)
 
     @property
     def configured(self) -> bool:
-        return bool(self.builds) or self.image_resolution is not None
+        return bool(self.builds) or bool(self.gpu_container)
 
     def summary_lines(self) -> List[str]:
         lines = []
-        if self.image_resolution is not None:
-            lines.append(self.image_resolution.summary())
-            if self.image_resolution.note:
-                lines.append(f"note: {self.image_resolution.note}")
+        if self.xpu_commit is not None:
+            lines.append(self.xpu_commit.summary())
+            if self.xpu_commit.dirty:
+                lines.append(
+                    f"note: {self.xpu_commit.path} has uncommitted changes; the GPU "
+                    f"peer is built from the committed sha only"
+                )
+        if self.gpu_container:
+            lines.append(f"gpu: {self.gpu_image} -> {self.gpu_container} (pinned image, not built)")
         for build in self.builds.values():
             lines.append(build.summary())
             if build.note:
                 lines.append(f"note: {build.note}")
+        lines.extend(f"note: {note}" for note in self.notes)
         return lines
 
 
@@ -403,6 +435,11 @@ def _install_script(device: str, commit: str, build_kernels: bool) -> str:
     lines = [
         "set -euo pipefail",
         f"cd {CONTAINER_SOURCE_DIR}",
+        # The tree is bind-mounted from the host, so it belongs to the host user
+        # while this script runs as the container's root. Without an exception git
+        # refuses it ("detected dubious ownership") and vLLM's setuptools-scm
+        # introspection fails, taking `pip install -e .` down with it.
+        f"git config --global --add safe.directory {CONTAINER_SOURCE_DIR}",
         # oneAPI images put the compiler env behind setvars.sh. `|| true` covers a
         # setvars that *returns* non-zero; one that calls `exit` still aborts the
         # script, which is the right outcome -- without a working oneAPI env the
@@ -550,27 +587,35 @@ def build_peer(
 
     if not rebuild:
         state = _container_state(name, runner)
-        if state == "running":
-            logger.info(f"Reusing running {device} peer {name}")
-            _assert_container_has_source(name, source_dir, runner)
-            return _finish_build(
-                device, commit, base_image or "(cached)", target_image, name,
-                source_dir, runner, built=False, precompiled=precompiled,
-                note="reused the running container; not rebuilt",
-            )
         if state is not None:
-            logger.info(f"Restarting {device} peer {name} (state={state})")
             _assert_container_has_source(name, source_dir, runner)
-            start = runner.run(f"docker start {shlex.quote(name)}", timeout=600)
-            if not start.ok:
-                raise VLLMBuildError(
-                    f"Could not start {name}: {start.stderr.strip()[:300]}"
+            if state == "running":
+                logger.info(f"Reusing running {device} peer {name}")
+                note = "reused the running container; not rebuilt"
+            else:
+                logger.info(f"Restarting {device} peer {name} (state={state})")
+                start = runner.run(f"docker start {shlex.quote(name)}", timeout=600)
+                if not start.ok:
+                    raise VLLMBuildError(
+                        f"Could not start {name}: {start.stderr.strip()[:300]}"
+                    )
+                note = "restarted an existing container; not rebuilt"
+
+            # A failed install leaves the container behind on purpose, so it can
+            # be inspected -- but it has the source mounted and no vLLM in it.
+            # Reusing that would dead-end every later run on "vLLM is not
+            # installed", so treat it as a cold cache and install again.
+            if detect_vllm_path(name, runner):
+                return _finish_build(
+                    device, commit, base_image or "(cached)", target_image, name,
+                    source_dir, runner, built=False, precompiled=precompiled,
+                    note=note,
                 )
-            return _finish_build(
-                device, commit, base_image or "(cached)", target_image, name,
-                source_dir, runner, built=False, precompiled=precompiled,
-                note="restarted an existing container; not rebuilt",
+            logger.warning(
+                f"{name} exists but has no vLLM installed (leftover from a failed "
+                "install); removing it and installing again"
             )
+            runner.run(f"docker rm -f {shlex.quote(name)}", timeout=300)
 
         cached = runner.run(f"docker image inspect {shlex.quote(target_image)}", timeout=120)
         if cached.ok:
@@ -712,6 +757,25 @@ def default_build_root(config: "DebugConfig") -> Path:
     return Path.home() / ".cache" / "accuracy_agent" / "builds"
 
 
+def _resolve_and_export(
+    config: "DebugConfig",
+    ref: str,
+    build_root: Path,
+    runner: CommandRunner,
+) -> Tuple[str, Path]:
+    """Resolve `ref` in a local vLLM clone and export it to its own checkout.
+
+    Raises:
+        VLLMBuildError: If no clone is available, or `ref` is not a commit of
+            vllm-project/vllm even after fetching.
+    """
+    repo = find_vllm_repo(config.vllm_repo_path, runner)
+    commit = resolve_commit(ref, repo, runner)
+    source_dir = ensure_source_tree(repo, commit, build_root, runner)
+    logger.info(f"vLLM commit {commit[:12]} exported to {source_dir}")
+    return commit, source_dir
+
+
 def autoconfigure_from_commit(
     config: "DebugConfig",
     launch: bool = True,
@@ -795,10 +859,9 @@ def autoconfigure_from_commit(
 
         local_runner = CommandRunner()
         runners.append(local_runner)
-        repo = find_vllm_repo(config.vllm_repo_path, local_runner)
-        commit = resolve_commit(config.vllm_commit, repo, local_runner)
-        source_dir = ensure_source_tree(repo, commit, build_root, local_runner)
-        logger.info(f"vLLM commit {commit[:12]} exported to {source_dir}")
+        commit, source_dir = _resolve_and_export(
+            config, config.vllm_commit, build_root, local_runner
+        )
 
         if not launch:
             return builds
@@ -830,6 +893,192 @@ def autoconfigure_from_commit(
     return builds
 
 
+def autoconfigure_gpu_from_xpu_commit(
+    config: "DebugConfig",
+    launch: bool = True,
+    allow_network: bool = True,
+    on_skip: Optional[Callable[[str], None]] = None,
+) -> GPUPeerFromXPU:
+    """Build a CUDA peer running the same vLLM commit as the existing XPU container.
+
+    This is the "I already have an XPU container, give me something to compare it
+    against" path. The XPU side is left exactly as it is -- it is the subject of
+    the comparison -- and only the GPU side is created:
+
+      1. ask the XPU container which commit its vLLM is (``detect_vllm_commit``),
+      2. resolve and export that commit from a local vllm-project/vllm clone,
+      3. install it into the newest ``nvcr.io/nvidia/pytorch`` image (``gpu.base_image``
+         to pin one), the same base the ``vllm.commit`` mode uses for CUDA.
+
+    Mutates on success: ``gpu_docker``, ``gpu_image``, ``gpu_vllm_path``,
+    ``gpu_inside_container`` (pinned False -- a freshly launched container is
+    never the one we run in) and ``vllm_commit`` (so reports name the commit that
+    was compared).
+
+    Returns an empty result when the mode does not apply:
+      - backend is not vLLM (this is vLLM-specific)
+      - ``gpu_docker`` is already set (explicit config always wins)
+      - ``gpu_auto_image`` is disabled
+      - the XPU docker is not reachable locally (a remote XPU container cannot be
+        interrogated cheaply, so its GPU peer is the user's to configure)
+      - no docker CLI, or no NVIDIA GPU on the GPU host -- e.g. an XPU-only box,
+        where the run should stay XPU-only
+      - the GPU host is remote but the build root is not on the shared filesystem,
+        so that host could not see the exported source tree
+
+    An explicit ``gpu.image`` short-circuits all of it: that image is started as
+    is, with nothing detected and nothing built.
+
+    Args:
+        on_skip: Called with the human-readable reason for each of those skips.
+
+    Raises:
+        VLLMBuildError: If the mode applies but fails -- commit undetectable, not
+            a commit of vllm-project/vllm, or the build/launch failed.
+    """
+    def skip(reason: str) -> None:
+        logger.info(f"Skipping GPU peer setup from the XPU container: {reason}")
+        if on_skip:
+            on_skip(reason)
+
+    peer = GPUPeerFromXPU()
+
+    if config.backend != "vllm":
+        skip(f"backend {config.backend!r} is not vllm")
+        return peer
+    if config.gpu_docker:
+        logger.debug(f"gpu_docker={config.gpu_docker!r} already set; not deriving a GPU peer")
+        return peer
+    if not getattr(config, "gpu_auto_image", False):
+        skip("gpu_auto_image is disabled")
+        return peer
+
+    inside_xpu = running_inside_container(config.xpu_vllm_path)
+    if not inside_xpu and not is_local_host(config.xpu_host):
+        skip(
+            f"the XPU docker runs on remote host {config.xpu_host!r}, so the vLLM "
+            "commit it runs cannot be auto-detected -- set gpu.docker/gpu.image, or "
+            "vllm.commit to build both sides from a known commit"
+        )
+        return peer
+    if not inside_xpu and not config.xpu_docker:
+        skip("no xpu.docker is configured")
+        return peer
+
+    xpu_runner = CommandRunner(host="", user=config.xpu_user)
+    gpu_runner = CommandRunner(
+        host=config.gpu_host,
+        user=config.gpu_user,
+        ssh_key_path=config.gpu_ssh_key_path,
+    )
+    local_runner = CommandRunner()
+
+    try:
+        if not inside_xpu and not docker_available(xpu_runner):
+            skip("no usable docker CLI on this machine")
+            return peer
+
+        # Both checks come before any repo work: exporting a commit is a
+        # multi-GB clone, and a box with no GPU to build for must not pay for it.
+        if launch:
+            if not docker_available(gpu_runner):
+                skip(f"no usable docker CLI on GPU host {config.gpu_host or 'localhost'}")
+                return peer
+            if not host_has_nvidia_gpu(gpu_runner):
+                skip(
+                    f"no NVIDIA GPU visible on {config.gpu_host or 'localhost'} -- "
+                    "leaving the GPU side unconfigured (XPU-only run)"
+                )
+                return peer
+
+        mounts = tuple(m for m in (config.shared_fs,) if m and Path(m).is_dir())
+
+        # Escape hatch: a ready-made GPU image is used as is. Nothing is detected
+        # and nothing is built, so the two sides' vLLM code is the user's to vouch
+        # for.
+        if config.gpu_image:
+            peer.image = config.gpu_image
+            if not launch:
+                return peer
+            container, _launched = ensure_gpu_container(
+                config.gpu_image,
+                gpu_runner,
+                container=config.gpu_container_name or None,
+                mounts=mounts,
+                extra_run_args=config.gpu_docker_run_args,
+            )
+            vllm_path = detect_vllm_path(container, gpu_runner)
+            if not vllm_path:
+                raise VLLMBuildError(
+                    f"Could not locate the vllm package inside container {container}. "
+                    f"Is {config.gpu_image} a vLLM image?"
+                )
+            config.gpu_docker = container
+            config.gpu_vllm_path = vllm_path
+            config.gpu_inside_container = False
+            peer.container = container
+            peer.note = "gpu.image was pinned, so the GPU peer's vLLM was not verified"
+            logger.info(f"GPU side configured from gpu.image: container={container}")
+            return peer
+
+        try:
+            xpu_commit = detect_vllm_commit(
+                config.xpu_docker,
+                xpu_runner,
+                inside_container=inside_xpu,
+                vllm_path=config.xpu_vllm_path,
+            )
+        except DockerProbeError as e:
+            raise VLLMBuildError(str(e)) from e
+        peer.xpu_commit = xpu_commit
+
+        build_root = default_build_root(config)
+        if not is_local_host(config.gpu_host) and not str(build_root).startswith(str(config.shared_fs)):
+            skip(
+                f"GPU host {config.gpu_host!r} is remote but the build root {build_root} "
+                f"is not under the shared filesystem {config.shared_fs!r}, so it cannot "
+                "see the source tree -- set vllm.build_root to a shared path"
+            )
+            return peer
+
+        commit, source_dir = _resolve_and_export(
+            config, xpu_commit.sha, build_root, local_runner
+        )
+        peer.commit = commit
+        # Record it so every later report names the commit that was compared,
+        # exactly as if it had been passed as vllm.commit.
+        config.vllm_commit = commit
+
+        if not launch:
+            return peer
+
+        build = build_peer(
+            "cuda",
+            commit,
+            str(source_dir),
+            gpu_runner,
+            base_image=config.gpu_base_image,
+            container=config.gpu_container_name,
+            mounts=mounts,
+            extra_run_args=config.gpu_docker_run_args,
+            build_kernels=config.vllm_build_kernels,
+            rebuild=config.vllm_build_rebuild,
+            allow_network=allow_network,
+        )
+        config.gpu_docker = build.container
+        config.gpu_image = build.image
+        config.gpu_vllm_path = build.vllm_path
+        config.gpu_inside_container = False
+        peer.build = build
+        logger.info(f"GPU peer ready: {build.summary()}")
+        return peer
+
+    finally:
+        xpu_runner.close()
+        gpu_runner.close()
+        local_runner.close()
+
+
 def maybe_autoconfigure_peers(
     config: "DebugConfig",
     launch: bool = True,
@@ -839,9 +1088,10 @@ def maybe_autoconfigure_peers(
     """Best-effort automatic peer configuration -- the single entry point.
 
     Dispatches on how the peers were requested:
-      - ``vllm.commit`` set: build both sides from that commit (this module)
-      - otherwise: match a released ``vllm/vllm-openai`` image to the XPU
-        container's version (``gpu_image_resolver``)
+      - ``vllm.commit`` set: build BOTH sides from that commit
+        (``autoconfigure_from_commit``)
+      - otherwise: keep the existing XPU container and build a CUDA peer running
+        the same commit it does (``autoconfigure_gpu_from_xpu_commit``)
 
     Never raises: automatic setup is a convenience, so a failure must not abort a
     run that could still proceed (XPU-only, or explicitly configured peers).
@@ -864,12 +1114,23 @@ def maybe_autoconfigure_peers(
             logger.warning(f"{message}. Continuing without built peers.")
             setup.skipped.append(message)
     else:
-        # The release-matching path keeps its own run-once guard, which is why
-        # this one uses a separate flag.
-        setup.image_resolution = maybe_autoconfigure_gpu_docker(
-            config, launch=launch, allow_network=allow_network,
-            on_skip=setup.skipped.append,
-        )
+        try:
+            peer = autoconfigure_gpu_from_xpu_commit(
+                config, launch=launch, allow_network=allow_network,
+                on_skip=setup.skipped.append,
+            )
+            setup.xpu_commit = peer.xpu_commit
+            setup.commit = peer.commit or None
+            setup.gpu_container = peer.container
+            setup.gpu_image = peer.image
+            if peer.build is not None:
+                setup.builds["gpu"] = peer.build
+            if peer.note:
+                setup.notes.append(peer.note)
+        except Exception as e:
+            message = f"Building a GPU peer for the XPU container failed: {e}"
+            logger.warning(f"{message}. Continuing without a GPU peer.")
+            setup.skipped.append(message)
 
     if on_skip:
         for reason in setup.skipped:

@@ -21,19 +21,21 @@ console = Console()
 @click.option('--gpu-docker', type=str, help='GPU docker container')
 @click.option('--xpu-host', type=str, help='XPU host')
 @click.option('--xpu-docker', type=str, help='XPU docker container')
-@click.option('--gpu-image', type=str, help='GPU docker image (default: matched to the XPU vLLM version)')
+@click.option('--gpu-image', type=str, help='Ready-made GPU docker image; skips detecting '
+                                            'the XPU commit and building a peer for it')
 @click.option('--no-auto-gpu-image', is_flag=True, default=False,
-              help='Do not derive/launch the GPU docker from the XPU vLLM version')
+              help='Do not build a GPU peer from the vLLM commit in the XPU docker')
 @click.option('--vllm-commit', type=str, default=None,
               help='vllm-project/vllm commit (sha/tag/branch) to install from source '
-                   'into the vendor PyTorch images on both sides')
+                   'into the vendor PyTorch images on BOTH sides (default: the commit '
+                   'the XPU docker already runs, GPU side only)')
 @click.option('--vllm-repo', type=str, default=None,
-              help='Local vllm-project/vllm clone to resolve --vllm-commit in (default: ~/vllm)')
+              help='Local vllm-project/vllm clone to resolve the commit in (default: ~/vllm)')
 @click.option('--build-kernels', is_flag=True, default=False,
-              help='With --vllm-commit: compile CUDA kernels at that commit (1-2h) instead '
-                   'of using the precompiled nightly wheel')
+              help='Compile CUDA kernels at the commit being built (1-2h) instead of '
+                   'using the precompiled nightly wheel')
 @click.option('--rebuild-vllm', is_flag=True, default=False,
-              help='With --vllm-commit: ignore cached built images and install again')
+              help='Ignore cached built images and install again')
 @click.option('--gpu-base-image', type=str, default=None,
               help='Base image for the built GPU peer (default: newest nvcr.io/nvidia/pytorch)')
 @click.option('--xpu-base-image', type=str, default=None,
@@ -123,9 +125,9 @@ def main(config, model, backend, gpu_host, gpu_docker, xpu_host, xpu_docker, gpu
             layer_end=layer_end if layer_end is not None else 3
         )
 
-    # Fill in the docker peers automatically (build them from --vllm-commit, or
-    # match a release image to the XPU container's version) before the config is
-    # printed, so the table below reflects what the run will actually use.
+    # Fill in the docker peers automatically (both from --vllm-commit, or just the
+    # GPU one from the commit the XPU docker runs) before the config is printed,
+    # so the table below reflects what the run will actually use.
     needs_peers = debug_config.backend == "vllm" and (
         debug_config.vllm_commit
         or (not debug_config.gpu_docker and debug_config.gpu_auto_image)
@@ -137,8 +139,13 @@ def main(config, model, backend, gpu_host, gpu_docker, xpu_host, xpu_docker, gpu
                 f"({'compiling CUDA kernels' if debug_config.vllm_build_kernels else 'precompiled kernels'})"
                 "...[/yellow]"
             )
+        elif debug_config.gpu_image:
+            console.print(f"[yellow]Starting the GPU peer from {debug_config.gpu_image}...[/yellow]")
         else:
-            console.print("[yellow]Matching GPU docker image to the XPU vLLM version...[/yellow]")
+            console.print(
+                "[yellow]Reading the vLLM commit out of the XPU docker and building "
+                "a matching CUDA peer...[/yellow]"
+            )
 
         setup = maybe_autoconfigure_peers(debug_config)
         for line in setup.summary_lines():

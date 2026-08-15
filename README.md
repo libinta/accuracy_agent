@@ -23,8 +23,9 @@ accuracy-debug \
 ```
 
 If the XPU docker runs on the same machine as the tool, the GPU side can be
-omitted: the vLLM version is read out of the XPU container and the matching
-`vllm/vllm-openai` release image is pulled and started automatically.
+omitted: the tool asks that container which exact vLLM **commit** it runs, then
+installs that commit into the NVIDIA PyTorch image (`nvcr.io/nvidia/pytorch`) and
+uses the result as the GPU peer — so both sides run the same vLLM code.
 
 ```bash
 accuracy-debug \
@@ -34,13 +35,16 @@ accuracy-debug \
   --shared-fs /mnt/weka
 ```
 
-See `examples/local_xpu_auto_gpu.yaml` and the "Automatic GPU Docker Selection"
-section of `examples/README_vllm.md`.
+The commit is resolved in a local `vllm-project/vllm` clone (`~/vllm` by default,
+`--vllm-repo` to override) and the built image is cached, so later runs with the
+same commit start in seconds. See `examples/local_xpu_auto_gpu.yaml` and the
+"Automatic GPU Peer From the XPU Container's Commit" section of
+`examples/README_vllm.md`.
 
-To test a specific `vllm-project/vllm` commit instead of a release, both peers
-can be built from it — the commit is installed from source into the vendor
-PyTorch images (`nvcr.io/nvidia/pytorch` and
-`intel/intel-extension-for-pytorch`), so the two sides differ only in device:
+To pin the commit instead of detecting it, both peers can be built from one you
+name — installed from source into the vendor PyTorch images
+(`nvcr.io/nvidia/pytorch` and `intel/intel-extension-for-pytorch`), so the two
+sides differ only in device:
 
 ```bash
 accuracy-debug \

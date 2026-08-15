@@ -1,4 +1,7 @@
-"""Tests for building both peers from one vllm-project/vllm commit.
+"""Tests for building peers from a vllm-project/vllm commit.
+
+Covers both modes: building both peers from a configured commit, and building
+only the CUDA peer from the commit an existing XPU container reports.
 
 Everything here is offline: git, docker and both registries are replaced by
 scripted fakes, so no network, no daemon, and no clone is touched.
@@ -8,8 +11,9 @@ import json
 import pytest
 
 from accuracy_agent.config import DebugConfig
-from accuracy_agent.gpu_image_resolver import CommandResult
+from accuracy_agent.docker_probe import CommandResult, DockerProbeError, VLLMCommit
 from accuracy_agent.vllm_source_builder import (
+    CONTAINER_SOURCE_DIR,
     DEFAULT_CUDA_BASE_IMAGE,
     DEFAULT_XPU_BASE_IMAGE,
     IPEX_REPO,
@@ -17,6 +21,7 @@ from accuracy_agent.vllm_source_builder import (
     VLLMBuild,
     VLLMBuildError,
     autoconfigure_from_commit,
+    autoconfigure_gpu_from_xpu_commit,
     build_image_tag,
     build_peer,
     ensure_source_tree,
@@ -137,6 +142,20 @@ def test_xpu_install_script_builds_from_source_with_pinned_kernels():
 def test_install_scripts_fail_loudly():
     for device in ("cuda", "xpu"):
         assert _install_script(device, SHA, False).startswith("set -euo pipefail")
+
+
+@pytest.mark.parametrize("device", ["cuda", "xpu"])
+def test_install_script_trusts_the_mounted_tree(device):
+    """The mount is owned by the host user; pip runs as the container's root.
+
+    Without the exception, git refuses the tree ("detected dubious ownership"),
+    vLLM's setuptools-scm introspection fails and the editable install dies at
+    metadata generation -- observed on a real NGC container.
+    """
+    script = _install_script(device, SHA, False)
+    assert f"git config --global --add safe.directory {CONTAINER_SOURCE_DIR}" in script
+    # Must come before anything that reads git metadata.
+    assert script.index("safe.directory") < script.index("pip install")
 
 
 @pytest.mark.parametrize("device,kernels", [("cuda", False), ("cuda", True), ("xpu", False)])
@@ -355,6 +374,41 @@ def test_build_peer_accepts_a_container_with_the_right_tree():
     assert build.container == "my_peer"
 
 
+def test_build_peer_replaces_a_container_left_by_a_failed_install():
+    """A failed install leaves the container behind for inspection.
+
+    It has the source mounted but no vLLM, so reusing it would dead-end every
+    later run on "vLLM is not installed"; it must be removed and installed into.
+    """
+    states = iter([
+        CommandResult(0, "running\n", ""),   # the leftover
+        CommandResult(0, "running\n", ""),   # the replacement, after launch
+    ])
+    # Only the first probe -- the leftover -- comes up empty; everything after
+    # the reinstall finds vLLM. (The install script mentions find_spec too, so
+    # the rule must tolerate being hit more than twice.)
+    probes = {"n": 0}
+
+    def probe_path():
+        probes["n"] += 1
+        if probes["n"] == 1:
+            return CommandResult(1, "", "ModuleNotFoundError")
+        return CommandResult(0, CONTAINER_SOURCE_DIR + "\n", "")
+
+    runner = _build_runner([
+        ("docker inspect -f", lambda: next(states)),
+        ("docker image inspect", CommandResult(1, "", "No such image")),
+        ("find_spec", probe_path),
+    ])
+    build = build_peer("xpu", SHA, "/src", runner, allow_network=False)
+
+    name = peer_container_name("xpu", SHA, False)
+    assert runner.ran(f"docker rm -f {name}")
+    assert runner.ran("pip install")      # it really did install this time
+    assert build.built is True
+    assert "not rebuilt" not in (build.note or "")
+
+
 def test_build_peer_restarts_stopped_container():
     runner = _build_runner([("docker inspect -f", CommandResult(0, "exited\n", ""))])
     build = build_peer("xpu", SHA, "/src", runner, allow_network=False)
@@ -498,7 +552,10 @@ def _install_fakes(monkeypatch, module, *, nvidia=True, xpu=True, docker=True):
     monkeypatch.setattr(module, "host_has_xpu", lambda runner: xpu)
     monkeypatch.setattr(module, "CommandRunner", lambda **kwargs: FakeRunner())
 
+    builds = []
+
     def fake_build(device, commit, source_dir, runner, **kwargs):
+        builds.append(dict(device=device, commit=commit, source_dir=source_dir, **kwargs))
         return VLLMBuild(
             device=device, commit=commit,
             base_image=f"base/{device}", image=build_image_tag(device, commit, False),
@@ -508,6 +565,7 @@ def _install_fakes(monkeypatch, module, *, nvidia=True, xpu=True, docker=True):
         )
 
     monkeypatch.setattr(module, "build_peer", fake_build)
+    return builds
 
 
 def test_autoconfigure_builds_both_peers(monkeypatch, tmp_path):
@@ -620,6 +678,255 @@ def test_autoconfigure_export_only_does_not_build(monkeypatch, tmp_path):
 
 
 # --------------------------------------------------------------------------
+# deriving the GPU peer from the commit an existing XPU container runs
+# --------------------------------------------------------------------------
+
+def _xpu_config(tmp_path, **overrides):
+    """A config with no vllm.commit: the commit comes from the XPU container."""
+    kwargs = dict(
+        vllm_commit="",
+        xpu_host="localhost",
+        xpu_docker="xpu_container",
+        xpu_vllm_path="/workspace/vllm",
+    )
+    kwargs.update(overrides)
+    return _commit_config(tmp_path, **kwargs)
+
+
+def _install_xpu_fakes(monkeypatch, module, *, commit=None, **kwargs):
+    """_install_fakes plus a scripted commit probe of the XPU container."""
+    builds = _install_fakes(monkeypatch, module, **kwargs)
+    monkeypatch.setattr(module, "running_inside_container", lambda path: False)
+    monkeypatch.setattr(
+        module, "detect_vllm_commit",
+        lambda container, runner, inside_container=False, vllm_path="":
+            commit or VLLMCommit(sha=SHA, source=f"git checkout {vllm_path}"),
+    )
+    return builds
+
+
+def test_gpu_peer_is_built_from_the_commit_the_xpu_container_runs(monkeypatch, tmp_path):
+    import accuracy_agent.vllm_source_builder as module
+
+    builds = _install_xpu_fakes(monkeypatch, module)
+    config = _xpu_config(tmp_path)
+
+    peer = autoconfigure_gpu_from_xpu_commit(config)
+
+    assert peer.xpu_commit.sha == SHA
+    assert peer.commit == SHA
+    assert peer.build.device == "cuda"
+    # Only the GPU side is created; the XPU container is the subject of the test.
+    assert [b["device"] for b in builds] == ["cuda"]
+    assert config.xpu_docker == "xpu_container"
+    assert config.xpu_vllm_path == "/workspace/vllm"
+    assert config.gpu_docker == peer_container_name("cuda", SHA, False)
+    assert config.gpu_image == build_image_tag("cuda", SHA, False)
+    assert config.gpu_vllm_path == "/workspace/vllm"
+    assert config.gpu_inside_container is False
+    # Recorded so later reports name the commit that was actually compared.
+    assert config.vllm_commit == SHA
+
+
+def test_gpu_peer_is_built_on_the_nvidia_pytorch_image(monkeypatch, tmp_path):
+    """No release image: the peer is the commit installed into NGC PyTorch."""
+    import accuracy_agent.vllm_source_builder as module
+
+    builds = _install_xpu_fakes(monkeypatch, module)
+    autoconfigure_gpu_from_xpu_commit(_xpu_config(tmp_path))
+
+    # An unset base_image means build_peer resolves the newest NGC tag itself.
+    assert builds[0]["base_image"] == ""
+    assert resolve_base_image("cuda", allow_network=False)[0].startswith(NGC_PYTORCH_REPO)
+
+
+def test_gpu_peer_honours_the_pinned_base_image_and_build_flags(monkeypatch, tmp_path):
+    import accuracy_agent.vllm_source_builder as module
+
+    builds = _install_xpu_fakes(monkeypatch, module)
+    config = _xpu_config(
+        tmp_path,
+        gpu_base_image=f"{NGC_PYTORCH_REPO}:25.12-py3",
+        vllm_build_kernels=True,
+        vllm_build_rebuild=True,
+    )
+
+    autoconfigure_gpu_from_xpu_commit(config)
+
+    assert builds[0]["base_image"] == f"{NGC_PYTORCH_REPO}:25.12-py3"
+    assert builds[0]["build_kernels"] is True
+    assert builds[0]["rebuild"] is True
+
+
+def test_a_dirty_xpu_checkout_is_reported(monkeypatch, tmp_path):
+    """Patches on top of the sha cannot be reproduced on the GPU side."""
+    import accuracy_agent.vllm_source_builder as module
+
+    _install_xpu_fakes(monkeypatch, module, commit=VLLMCommit(
+        sha=SHA, source="git checkout /workspace/vllm", dirty=True, path="/workspace/vllm",
+    ))
+    setup = maybe_autoconfigure_peers(_xpu_config(tmp_path))
+
+    assert any("uncommitted changes" in line for line in setup.summary_lines())
+
+
+def test_no_gpu_peer_is_built_without_an_nvidia_gpu(monkeypatch, tmp_path):
+    """On an XPU-only box the run stays XPU-only -- and pays for no clone."""
+    import accuracy_agent.vllm_source_builder as module
+
+    _install_xpu_fakes(monkeypatch, module, nvidia=False)
+
+    def fail(*a, **k):  # pragma: no cover - must not be called
+        raise AssertionError("no GPU to build for means no repo work")
+
+    monkeypatch.setattr(module, "find_vllm_repo", fail)
+    monkeypatch.setattr(module, "ensure_source_tree", fail)
+    config = _xpu_config(tmp_path)
+    reasons = []
+
+    peer = autoconfigure_gpu_from_xpu_commit(config, on_skip=reasons.append)
+
+    assert peer.build is None and peer.commit == ""
+    assert config.gpu_docker == ""
+    assert any("NVIDIA GPU" in r for r in reasons)
+
+
+def test_remote_xpu_docker_is_not_probed(monkeypatch, tmp_path):
+    import accuracy_agent.vllm_source_builder as module
+
+    _install_xpu_fakes(monkeypatch, module)
+
+    def fail(*a, **k):  # pragma: no cover - must not be called
+        raise AssertionError("a remote XPU container cannot be probed")
+
+    monkeypatch.setattr(module, "detect_vllm_commit", fail)
+    config = _xpu_config(tmp_path, xpu_host="xpu-host.example.com")
+    reasons = []
+
+    assert autoconfigure_gpu_from_xpu_commit(config, on_skip=reasons.append).commit == ""
+    assert config.gpu_docker == ""
+    assert any("remote host" in r for r in reasons)
+
+
+def test_explicit_gpu_docker_wins(monkeypatch, tmp_path):
+    import accuracy_agent.vllm_source_builder as module
+
+    _install_xpu_fakes(monkeypatch, module)
+
+    def fail(*a, **k):  # pragma: no cover - must not be called
+        raise AssertionError("explicit gpu_docker must win")
+
+    monkeypatch.setattr(module, "detect_vllm_commit", fail)
+    config = _xpu_config(tmp_path, gpu_docker="my_gpu_container")
+
+    assert autoconfigure_gpu_from_xpu_commit(config).commit == ""
+    assert config.gpu_docker == "my_gpu_container"
+
+
+def test_auto_image_can_be_disabled(monkeypatch, tmp_path):
+    import accuracy_agent.vllm_source_builder as module
+
+    _install_xpu_fakes(monkeypatch, module)
+    config = _xpu_config(tmp_path, gpu_auto_image=False)
+    reasons = []
+
+    assert autoconfigure_gpu_from_xpu_commit(config, on_skip=reasons.append).commit == ""
+    assert config.gpu_docker == ""
+    assert any("gpu_auto_image" in r for r in reasons)
+
+
+def test_pinned_gpu_image_is_launched_without_building(monkeypatch, tmp_path):
+    import accuracy_agent.vllm_source_builder as module
+
+    _install_xpu_fakes(monkeypatch, module)
+
+    def fail(*a, **k):  # pragma: no cover - must not be called
+        raise AssertionError("gpu.image must skip both detection and building")
+
+    monkeypatch.setattr(module, "detect_vllm_commit", fail)
+    monkeypatch.setattr(module, "build_peer", fail)
+    monkeypatch.setattr(
+        module, "ensure_gpu_container",
+        lambda image, runner, container=None, mounts=(), extra_run_args="": ("gpu_pinned", True),
+    )
+    monkeypatch.setattr(module, "detect_vllm_path", lambda c, r: "/usr/lib/python3/dist-packages")
+    config = _xpu_config(tmp_path, gpu_image="my-registry/vllm:my-build")
+
+    peer = autoconfigure_gpu_from_xpu_commit(config)
+
+    assert peer.container == "gpu_pinned"
+    assert config.gpu_docker == "gpu_pinned"
+    assert config.gpu_vllm_path == "/usr/lib/python3/dist-packages"
+    assert config.gpu_inside_container is False
+    assert "not verified" in peer.note
+
+
+def test_undetectable_commit_fails_with_a_way_out(monkeypatch, tmp_path):
+    """A release wheel records no commit; the message must say what to do."""
+    import accuracy_agent.vllm_source_builder as module
+
+    _install_xpu_fakes(monkeypatch, module)
+
+    def boom(*a, **k):
+        raise DockerProbeError("no +g<sha> build part; set vllm.commit or gpu.docker")
+
+    monkeypatch.setattr(module, "detect_vllm_commit", boom)
+
+    with pytest.raises(VLLMBuildError, match="set vllm.commit or gpu.docker"):
+        autoconfigure_gpu_from_xpu_commit(_xpu_config(tmp_path))
+
+
+def test_a_commit_that_is_not_upstream_fails_loudly(monkeypatch, tmp_path):
+    """A fork's sha is not in vllm-project/vllm, so no peer can be built."""
+    import accuracy_agent.vllm_source_builder as module
+
+    _install_xpu_fakes(monkeypatch, module)
+
+    def boom(ref, repo, runner=None, allow_fetch=True):
+        raise VLLMBuildError(f"{ref!r} could not be resolved to a commit")
+
+    monkeypatch.setattr(module, "resolve_commit", boom)
+
+    with pytest.raises(VLLMBuildError, match="could not be resolved"):
+        autoconfigure_gpu_from_xpu_commit(_xpu_config(tmp_path))
+
+
+def test_detect_only_does_not_build(monkeypatch, tmp_path):
+    import accuracy_agent.vllm_source_builder as module
+
+    _install_xpu_fakes(monkeypatch, module)
+
+    def fail(*a, **k):  # pragma: no cover - must not be called
+        raise AssertionError("launch=False must not build containers")
+
+    monkeypatch.setattr(module, "build_peer", fail)
+    config = _xpu_config(tmp_path)
+
+    peer = autoconfigure_gpu_from_xpu_commit(config, launch=False)
+
+    assert peer.commit == SHA
+    assert peer.build is None
+    assert config.gpu_docker == ""
+
+
+def test_remote_gpu_host_needs_a_shared_build_root(monkeypatch, tmp_path):
+    """The GPU host has to be able to see the exported source tree."""
+    import accuracy_agent.vllm_source_builder as module
+
+    _install_xpu_fakes(monkeypatch, module)
+    config = _xpu_config(
+        tmp_path,
+        gpu_host="gpu-host.example.com",
+        vllm_build_root=str(tmp_path.parent / "not-shared"),
+    )
+    reasons = []
+
+    assert autoconfigure_gpu_from_xpu_commit(config, on_skip=reasons.append).commit == ""
+    assert config.gpu_docker == ""
+    assert any("shared" in r for r in reasons)
+
+
+# --------------------------------------------------------------------------
 # the single entry point both the CLI and the Bisector use
 # --------------------------------------------------------------------------
 
@@ -629,9 +936,9 @@ def test_maybe_autoconfigure_dispatches_to_the_commit_path(monkeypatch, tmp_path
     _install_fakes(monkeypatch, module)
 
     def fail(*a, **k):  # pragma: no cover - must not be called
-        raise AssertionError("a commit build must not also match release images")
+        raise AssertionError("an explicit commit must not also probe the XPU container")
 
-    monkeypatch.setattr(module, "maybe_autoconfigure_gpu_docker", fail)
+    monkeypatch.setattr(module, "autoconfigure_gpu_from_xpu_commit", fail)
     setup = maybe_autoconfigure_peers(_commit_config(tmp_path))
 
     assert setup.commit == SHA
@@ -640,18 +947,36 @@ def test_maybe_autoconfigure_dispatches_to_the_commit_path(monkeypatch, tmp_path
     assert any(SHORT in line for line in setup.summary_lines())
 
 
-def test_maybe_autoconfigure_falls_back_to_release_matching(monkeypatch, tmp_path):
+def test_maybe_autoconfigure_dispatches_to_the_xpu_commit_path(monkeypatch, tmp_path):
     import accuracy_agent.vllm_source_builder as module
 
-    called = []
-    monkeypatch.setattr(
-        module, "maybe_autoconfigure_gpu_docker",
-        lambda config, launch=True, allow_network=True, on_skip=None: called.append(config) or None,
-    )
-    setup = maybe_autoconfigure_peers(_commit_config(tmp_path, vllm_commit=""))
+    _install_xpu_fakes(monkeypatch, module)
+    config = _xpu_config(tmp_path)
 
-    assert len(called) == 1
-    assert setup.builds == {}
+    setup = maybe_autoconfigure_peers(config)
+
+    assert setup.commit == SHA
+    assert setup.xpu_commit.sha == SHA
+    assert set(setup.builds) == {"gpu"}
+    assert setup.configured
+    assert any(SHORT in line for line in setup.summary_lines())
+
+
+def test_maybe_autoconfigure_reports_an_undetectable_commit_without_raising(monkeypatch, tmp_path):
+    import accuracy_agent.vllm_source_builder as module
+
+    _install_xpu_fakes(monkeypatch, module)
+
+    def boom(*a, **k):
+        raise DockerProbeError("no commit in there")
+
+    monkeypatch.setattr(module, "detect_vllm_commit", boom)
+    reasons = []
+
+    setup = maybe_autoconfigure_peers(_xpu_config(tmp_path), on_skip=reasons.append)
+
+    assert setup.configured is False
+    assert any("no commit in there" in r for r in reasons)
 
 
 def test_maybe_autoconfigure_reports_failure_without_raising(monkeypatch, tmp_path):
