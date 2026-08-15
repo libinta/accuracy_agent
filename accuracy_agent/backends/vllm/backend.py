@@ -152,7 +152,11 @@ class VLLMBackend(Backend):
         logger.debug(f"Command: {cmd}")
 
         # Execute in docker
-        stdout, stderr = self.patcher.exec_in_docker(cmd)
+        # stream=True: this is the long-running vLLM engine run; mirror its
+        # output live so shard-load %, HPU compile/warmup and forward progress
+        # are visible instead of a multi-minute silent hang. All the short
+        # patch-time file ops use the default (quiet) exec_in_docker.
+        stdout, stderr = self.patcher.exec_in_docker(cmd, stream=True)
 
         # Dump the debug_runner subprocess output to a file so its prints
         # (enforce_eager value, compile/graph signals, capture diagnostics) are
@@ -178,8 +182,13 @@ class VLLMBackend(Backend):
         # debug_runner.main() prints an "ERROR:" line + a traceback on real
         # failure, so key off those. Final success is still gated on the output
         # file existing below (so a missed signal cannot pass silently).
-        if stderr and ("ERROR:" in stderr or "Traceback (most recent call last)" in stderr):
-            raise RuntimeError(f"vLLM execution failed: {stderr}")
+        # Local runs now STREAM output: exec_in_docker merges child stdout+stderr
+        # and returns it as stdout (stderr empty), so scan BOTH streams for the
+        # failure signals. Remote (SSH) runs still split the two, so the union
+        # covers both transports.
+        combined = f"{stdout}\n{stderr}"
+        if "ERROR:" in combined or "Traceback (most recent call last)" in combined:
+            raise RuntimeError(f"vLLM execution failed:\n{combined}")
 
         # A remote backend wrote output_path onto ITS filesystem, which the two
         # containers generally do not share. Pull it (and the per-layer

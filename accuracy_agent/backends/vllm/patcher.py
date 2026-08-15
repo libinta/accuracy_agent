@@ -1,6 +1,7 @@
 """Auto-patch vLLM source to enable layer extraction via SSH"""
 
 import os
+import sys
 import paramiko
 import subprocess
 import socket
@@ -208,7 +209,7 @@ class VLLMPatcher:
             self.ssh_client = None
             logger.info(f"Disconnected from {self.host}")
 
-    def exec_in_docker(self, cmd: str) -> tuple[str, str]:
+    def exec_in_docker(self, cmd: str, stream: bool = False) -> tuple[str, str]:
         """
         Execute command in docker container (or locally if running inside it)
 
@@ -219,18 +220,53 @@ class VLLMPatcher:
             Tuple of (stdout, stderr) as strings
         """
         if self.is_local:
-            # Execute locally using subprocess
-            logger.debug(f"Executing locally: {cmd}")
+            # Only STREAM when the caller asks (stream=True) -- i.e. the single
+            # long-running vLLM run in run_layer_range, which otherwise hangs
+            # silently for minutes under capture_output. The many short internal
+            # ops that also go through here (cat/base64/test -f while patching)
+            # must stay QUIET; streaming them dumped whole source files and stray
+            # numbers to the console. Default stream=False restores that quiet
+            # capture; stream=True mirrors child stdout+stderr live to THIS
+            # process's stderr while still capturing the full text.
+            logger.debug(f"Executing locally (stream={stream}): {cmd}")
+            if not stream:
+                try:
+                    result = subprocess.run(
+                        ["bash", "-c", cmd],
+                        capture_output=True,
+                        text=True,
+                        timeout=_EXEC_TIMEOUT,
+                    )
+                    return result.stdout, result.stderr
+                except subprocess.TimeoutExpired:
+                    return "", f"Command timed out after {_EXEC_TIMEOUT}s"
+                except Exception as e:
+                    return "", f"Local execution failed: {e}"
             try:
-                result = subprocess.run(
+                proc = subprocess.Popen(
                     ["bash", "-c", cmd],
-                    capture_output=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,  # merge so ordering is preserved
                     text=True,
-                    timeout=_EXEC_TIMEOUT
+                    bufsize=1,  # line-buffered
                 )
-                return result.stdout, result.stderr
-            except subprocess.TimeoutExpired:
-                return "", f"Command timed out after {_EXEC_TIMEOUT}s"
+                captured = []
+                try:
+                    for line in proc.stdout:  # blocks per line until EOF
+                        captured.append(line)
+                        sys.stderr.write(line)
+                        sys.stderr.flush()
+                    proc.wait(timeout=_EXEC_TIMEOUT)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+                    return "".join(captured), f"Command timed out after {_EXEC_TIMEOUT}s"
+                out = "".join(captured)
+                # stderr was merged into stdout for live ordering; the caller's
+                # failure check scans BOTH streams for ERROR:/Traceback, so
+                # returning the merged text as stdout (stderr empty) is safe and
+                # loses no signal.
+                return out, ""
             except Exception as e:
                 return "", f"Local execution failed: {e}"
 

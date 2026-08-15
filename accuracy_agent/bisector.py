@@ -116,17 +116,21 @@ class Bisector:
             print(f"✓ {device_name} backend ready")
             return backend
 
-        # XPU-only mode: no GPU peer configured. Skip the GPU backend entirely
-        # (on an XPU-only host a "cuda" backend has no device and would land on
-        # a busy XPU card and fail) and set up only the XPU backend.
+        # Label the DUT slot by its real device type (XPU for Intel GPU, HPU for
+        # Intel Gaudi), not a hardcoded "XPU" -- a Gaudi run sets device_type=hpu.
+        dut_label = (self.config.dut_device_type or "xpu").upper()
+
+        # DUT-only mode: no GPU peer configured. Skip the GPU backend entirely
+        # (on a DUT-only host a "cuda" backend has no device and would land on
+        # a busy DUT card and fail) and set up only the DUT backend.
         if self.dut_only:
-            dut_backend = setup_backend(dut_config, "XPU")
+            dut_backend = setup_backend(dut_config, dut_label)
             return None, dut_backend
 
         # Run GPU and XPU setup in parallel
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
             gpu_future = executor.submit(setup_backend, gpu_config, "GPU")
-            dut_future = executor.submit(setup_backend, dut_config, "XPU")
+            dut_future = executor.submit(setup_backend, dut_config, dut_label)
 
             gpu_backend = gpu_future.result()
             dut_backend = dut_future.result()
@@ -269,7 +273,7 @@ class Bisector:
             print(f"Comparing representative layers: {', '.join(labels)}")
             print(f"{'='*60}\n")
 
-            # XPU-only mode has no GPU peer -- fall back to extracting each
+            # dut-only mode has no GPU peer -- fall back to extracting each
             # representative layer's hidden states without comparison.
             if self.use_backends and self.dut_only:
                 last = None
@@ -330,8 +334,8 @@ class Bisector:
             BisectionResult with divergent layer (if found)
         """
         try:
-            # Setup backends if using new backend system. In XPU-only mode the
-            # GPU backend is intentionally None, so gate setup on the XPU one.
+            # Setup backends if using new backend system. In dut-only mode the
+            # GPU backend is intentionally None, so gate setup on the dut one.
             if self.use_backends:
                 needs_setup = self.dut_backend is None or (
                     not self.dut_only and self.gpu_backend is None
@@ -343,7 +347,7 @@ class Bisector:
             print(f"Bisecting layers {layer_start}-{layer_end}")
             print(f"{'='*60}\n")
 
-            # XPU-only extraction: capture XPU hidden states, no comparison.
+            # dut-only extraction: capture dut hidden states, no comparison.
             if self.use_backends and self.dut_only:
                 return self._extract_dut_only(layer_start, layer_end)
 

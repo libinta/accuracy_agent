@@ -169,7 +169,33 @@ class GLM52PatchProvider(GLMPatchProvider):
     def get_model_class_name(self) -> str:
         """
         Returns:
-            GLM-5.2 may use Glm4Model or a specific Glm52Model class
+            GLM-5.2 is served by vLLM's DeepseekV2Model (arch
+            GlmMoeDsaForCausalLM -> deepseek_v2.py), not Glm4Model.
         """
-        # GLM-5.2 likely reuses Glm4Model architecture
-        return 'Glm4Model'
+        return 'DeepseekV2Model'
+
+    def get_model_file_path(self) -> str:
+        """
+        GLM-5.2 (model_type=glm_moe_dsa, arch GlmMoeDsaForCausalLM) is served
+        by vLLM's deepseek_v2.py -- NOT glm4.py. Point the model-file patch at
+        the file that actually backs the architecture so the anchor resolves.
+        """
+        return 'vllm/model_executor/models/deepseek_v2.py'
+
+    def get_layer_init_patch(self) -> str:
+        """No-op the model-file layer-init patch for GLM-5.2.
+
+        The inherited GLM patch body references `layer_type`/`num_hidden_layers`
+        and emits a mid-__init__ `return`, which is valid for glm4.py's
+        make_layers site but would BREAK DeepseekV2Model.__init__ (those names
+        don't exist there and the early return aborts module construction).
+        Layer-window limiting is already handled architecture-agnostically by
+        the make_layers clamp (_apply_make_layers_fix, utils.py) plus the
+        env-based weight filter, so no model-file layer-init edit is needed
+        here. Returning a comment-only body makes the anchored insertion inert
+        (it inserts a comment before the make_layers call and changes nothing).
+        """
+        return (
+            "# === ACCURACY_AGENT PATCH (GLM-5.2): layer-init handled by "
+            "make_layers clamp; no model-file edit needed ===\n"
+        )
