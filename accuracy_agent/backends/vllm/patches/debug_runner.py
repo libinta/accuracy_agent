@@ -163,13 +163,21 @@ def run_partial_layers(
     # block allocation fails the startup check).
     gpu_mem_util = float(os.environ.get("ACCURACY_GPU_MEM_UTIL", "0.4"))
 
+    # Execution mode. Default True = eager (current, stable path). Set
+    # ACCURACY_ENFORCE_EAGER=false to let vLLM-Gaudi take its torch.compile
+    # path (HPU default when PT_HPU_LAZY_MODE=0 and enforce_eager is off). This
+    # is the switch for the compile-mode bring-up experiment; forward-hook
+    # capture may need rework under compile (Dynamo can skip/break on hooks).
+    enforce_eager = os.environ.get("ACCURACY_ENFORCE_EAGER", "true").lower() not in ("0", "false", "no")
+
     # Load model with vLLM
     print(f"Loading model from {model_path} with mode={load_mode}, "
-          f"tensor_parallel_size={num_cards}, gpu_memory_utilization={gpu_mem_util}")
+          f"tensor_parallel_size={num_cards}, gpu_memory_utilization={gpu_mem_util}, "
+          f"enforce_eager={enforce_eager}")
     llm = LLM(
         model=model_path,
         trust_remote_code=True,
-        enforce_eager=True,
+        enforce_eager=enforce_eager,
         gpu_memory_utilization=gpu_mem_util,
         tensor_parallel_size=num_cards,
         max_model_len=2048,  # Small ctx: shrinks KV-cache + profiling peak

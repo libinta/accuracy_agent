@@ -35,6 +35,7 @@ class VLLMBackend(Backend):
             vllm_path=config.vllm_path,
             user=config.user,
             model_name=model_name,
+            device_type=config.device_type,
         )
         self.is_patched = False
         self.memory_mode = None  # Will be set in setup()
@@ -152,6 +153,23 @@ class VLLMBackend(Backend):
 
         # Execute in docker
         stdout, stderr = self.patcher.exec_in_docker(cmd)
+
+        # Dump the debug_runner subprocess output to a file so its prints
+        # (enforce_eager value, compile/graph signals, capture diagnostics) are
+        # inspectable -- exec_in_docker captures them, so they never reach the
+        # parent CLI log otherwise. Best-effort; keyed by device+layer window.
+        # Written to the current working directory (where the CLI is launched)
+        # so it lands next to the run instead of at the shared_fs root.
+        try:
+            _dbg = (
+                Path.cwd()
+                / f"debugrunner_{self.config.device_type}_{layer_start}_{layer_end}.log"
+            )
+            _dbg.write_text(
+                f"$ {cmd}\n\n===== STDOUT =====\n{stdout}\n\n===== STDERR =====\n{stderr}\n"
+            )
+        except Exception:
+            pass
 
         # Only treat EXPLICIT failure signals as fatal here. A bare
         # "error" substring is too broad: HPU emits benign warnings

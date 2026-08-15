@@ -29,7 +29,8 @@ class VLLMPatcher:
         docker: str,
         vllm_path: str,
         user: str = "root",
-        model_name: Optional[str] = None
+        model_name: Optional[str] = None,
+        device_type: str = "xpu",
     ):
         """
         Initialize patcher
@@ -41,12 +42,19 @@ class VLLMPatcher:
             user: SSH username (default: "root")
             model_name: Model name for model-specific patches (e.g., "glm-5.2", "llama-3")
                        If None, uses generic patches
+            device_type: Device under test ("xpu", "hpu", or "cuda"). Gates the
+                       Intel-XPU-only kernel fixes: a vLLM wheel ships the XPU
+                       kernel files (scaled_mm/xpu.py, xpu_mla_sparse.py) on
+                       every platform, so a bare file-exists check would try to
+                       patch them on a Gaudi/CUDA run and log a spurious
+                       "Could not apply XPU ... fix" anchor warning.
         """
         self.host = host
         self.docker = docker
         self.vllm_path = vllm_path
         self.user = user
         self.model_name = model_name
+        self.device_type = device_type
         self.ssh_client: Optional[paramiko.SSHClient] = None
         self.patch_provider: Optional[BaseModelPatchProvider] = None
         self.is_local = self._detect_local()
@@ -523,19 +531,27 @@ class VLLMPatcher:
         debug_runner_container = f"{self.vllm_path}/vllm/model_executor/debug_runner.py"
         self.copy_file_to_container(debug_runner_local, debug_runner_container)
 
-        # Apply XPU memory detection fix
-        self._apply_xpu_memory_fix()
-
-        # Apply architecture-agnostic layer-limiting fix (make_layers)
+        # Apply architecture-agnostic layer-limiting fix (make_layers) -- this is
+        # device-independent and needed on every backend.
         self._apply_make_layers_fix()
 
-        # Sync XPU sparse-MLA backend to the refactored shared MLA forward
-        # (no-op on non-XPU vLLM trees where the file is absent)
-        self._apply_sparse_mla_fix()
-
-        # Pad ragged-N FP8 block-scaled GEMM so oneDNN XPU matmul accepts it
-        # (no-op on non-XPU vLLM trees where the file is absent)
-        self._apply_fp8_gemm_fix()
+        # Intel-XPU-only kernel fixes. Gate on device_type: a vLLM wheel ships
+        # the XPU kernel files (scaled_mm/xpu.py, xpu_mla_sparse.py, mem_utils
+        # XPU branch) on Gaudi/CUDA too, so a bare file-exists check would try to
+        # patch them off-XPU and emit a misleading "Could not apply XPU ... fix"
+        # anchor warning on every Gaudi run. Only Intel XPU actually needs them.
+        if self.device_type == "xpu":
+            # XPU memory detection fix (torch.xpu.get_memory_info bug)
+            self._apply_xpu_memory_fix()
+            # Sync XPU sparse-MLA backend to the refactored shared MLA forward
+            self._apply_sparse_mla_fix()
+            # Pad ragged-N FP8 block-scaled GEMM so oneDNN XPU matmul accepts it
+            self._apply_fp8_gemm_fix()
+        else:
+            logger.info(
+                "Skipping Intel-XPU-only kernel fixes (device_type=%s)",
+                self.device_type,
+            )
 
         logger.info("All patches applied successfully")
 
@@ -924,11 +940,18 @@ if _aa_start is not None and _aa_end is not None:
         files_to_restore = [
             f"{self.vllm_path}/vllm/model_executor/model_loader/default_loader.py",
             f"{self.vllm_path}/vllm/model_executor/models/llama.py",
-            f"{self.vllm_path}/vllm/utils/mem_utils.py",
             f"{self.vllm_path}/vllm/model_executor/models/utils.py",
-            f"{self.vllm_path}/vllm/v1/attention/backends/mla/xpu_mla_sparse.py",
-            f"{self.vllm_path}/vllm/model_executor/kernels/linear/scaled_mm/xpu.py",
         ]
+
+        # Intel-XPU-only files: only patched when device_type == "xpu", so only
+        # restore them there (restore_original is a safe no-op without a backup,
+        # but gating keeps cleanup symmetric with apply_all_patches).
+        if self.device_type == "xpu":
+            files_to_restore += [
+                f"{self.vllm_path}/vllm/utils/mem_utils.py",
+                f"{self.vllm_path}/vllm/v1/attention/backends/mla/xpu_mla_sparse.py",
+                f"{self.vllm_path}/vllm/model_executor/kernels/linear/scaled_mm/xpu.py",
+            ]
 
         # Add model-specific file if using model-specific patches
         if self.patch_provider:
