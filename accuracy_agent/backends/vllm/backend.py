@@ -28,7 +28,19 @@ class VLLMBackend(Backend):
             shared_fs: Shared filesystem path for exchanging tensors
         """
         super().__init__(config, model_path, shared_fs)
+        # Model-type routing (VLLMPatcher._get_patch_provider) substring-matches
+        # on this name. The HF hub cache resolves a model to
+        # ".../models--Org--Model/snapshots/<commit-hash>", whose leaf dir name is
+        # a bare commit hash -- so Path(model_path).name would be a hash and route
+        # to the wrong (fallback) provider. Walk up to the "models--Org--Model"
+        # component so a snapshot path still carries the real model name.
         model_name = Path(model_path).name
+        _parts = Path(model_path).parts
+        if "snapshots" in _parts:
+            for _part in _parts:
+                if _part.startswith("models--"):
+                    model_name = _part
+                    break
         self.patcher = VLLMPatcher(
             host=config.host,
             docker=config.docker,
