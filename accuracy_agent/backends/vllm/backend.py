@@ -208,7 +208,16 @@ class VLLMBackend(Backend):
         # failure signals. Remote (SSH) runs still split the two, so the union
         # covers both transports.
         combined = f"{stdout}\n{stderr}"
-        if "ERROR:" in combined or "Traceback (most recent call last)" in combined:
+        # Key ONLY off debug_runner.main()'s explicit "ERROR:" line. A bare
+        # "Traceback (most recent call last)" is NOT reliable: Python's logging
+        # module CATCHES exceptions raised inside a log record's formatting and
+        # prints a full "--- Logging error ---" traceback while execution
+        # CONTINUES. vLLM's XPU platform hits exactly this (xpu.py: the
+        # "[XPU]Setting attention block size ..." message passes None for two %d
+        # fields on the non-mamba path), so scanning for "Traceback" would abort
+        # a run that actually succeeded. A real uncaught crash still produces no
+        # output file and is caught by the existence check below.
+        if "ERROR:" in combined:
             raise RuntimeError(f"vLLM execution failed:\n{combined}")
 
         # A remote backend wrote output_path onto ITS filesystem, which the two
