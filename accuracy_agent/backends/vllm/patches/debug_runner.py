@@ -381,16 +381,31 @@ def run_partial_layers(
             "The decoder stack may not have reached the requested layers."
         )
 
+    # Trim PAD tokens before saving. HPU pads the prompt up to a bucket size
+    # (e.g. 7 -> 128 in the smallest prompt bucket), so its captured hidden
+    # states carry trailing PAD rows along the sequence dim that GPU/XPU
+    # (unpadded) never produce. Comparing them would trip the comparator's shape
+    # check ("[7,2048] vs [128,2048]") even though the real tokens match. Keep
+    # only the real prompt tokens (right-padding => they are the leading rows);
+    # a no-op on unpadded backends where dim0 already equals n_real.
+    n_real = input_ids.shape[1]
+
+    def _trim_pad(t):
+        if hasattr(t, "shape") and t.dim() >= 1 and t.shape[0] > n_real:
+            return t[:n_real]
+        return t
+
     # The tool compares the hidden state after the deepest requested layer.
     deepest = max(captured)
-    hidden_states = captured[deepest]
+    hidden_states = _trim_pad(captured[deepest])
     print(f"Captured layers {sorted(captured)}; saving layer {deepest} "
           f"hidden state shape {tuple(hidden_states.shape)} to {output_path}")
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(hidden_states, output_path)
-    # Full per-layer dict alongside, for finer-grained bisection.
-    torch.save(dict(captured), str(output_path) + ".alllayers")
+    # Full per-layer dict alongside, for finer-grained bisection (also trimmed).
+    torch.save({k: _trim_pad(v) for k, v in captured.items()},
+               str(output_path) + ".alllayers")
     print(f"Successfully saved to {output_path}")
 
 
