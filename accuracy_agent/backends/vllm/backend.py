@@ -146,10 +146,19 @@ class VLLMBackend(Backend):
 
         # Construct command to run debug_runner.py
         # Use shlex.quote for all paths and user-provided strings to prevent shell injection
+        #
+        # Resolve the interpreter INSIDE the target shell rather than hardcoding
+        # "python": some containers (e.g. the NVIDIA H200 image) ship only
+        # "python3" and have no "python" alias, which failed with
+        # "python: command not found". Prefer "python" (unchanged behavior on the
+        # XPU/Gaudi containers that have it) and fall back to "python3". The
+        # command substitution works both for the local `bash -c` path and the
+        # remote `docker exec ... bash -c` path.
+        py = "$(command -v python || command -v python3)"
         cmd = (
             f"cd {shlex.quote(self.config.vllm_path)} && "
             f"{affinity_env}"
-            f"python -m vllm.model_executor.debug_runner "
+            f"{py} -m vllm.model_executor.debug_runner "
             f"--model-path {shlex.quote(self.model_path)} "
             f"--layer-start {layer_start} "
             f"--layer-end {layer_end} "
