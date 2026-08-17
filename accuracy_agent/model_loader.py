@@ -40,6 +40,51 @@ def _compute_layer_groups(config: dict, num_layers: int) -> List[Tuple[str, int]
             groups.append(("moe", min(first_k_dense, num_layers - 1)))
         return groups or [("standard", 0)]
 
+    # --- Qwen3-MoE lineage: num_experts present, dense layers selected by
+    # mlp_only_layers / decoder_sparse_step (no first_k_dense_replace like the
+    # DeepSeek/GLM family). Pick the first dense and first MoE layer as the two
+    # unique representatives. ---
+    qwen_experts = config.get("num_experts")
+    if qwen_experts and first_k_dense is None and (
+        "decoder_sparse_step" in config or "mlp_only_layers" in config
+    ):
+        mlp_only = set(config.get("mlp_only_layers") or [])
+        sparse_step = config.get("decoder_sparse_step", 1) or 1
+
+        def _is_moe(idx: int) -> bool:
+            if idx in mlp_only:
+                return False
+            return (idx + 1) % sparse_step == 0
+
+        dense_idx = next((i for i in range(num_layers) if not _is_moe(i)), None)
+        moe_idx = next((i for i in range(num_layers) if _is_moe(i)), None)
+        groups: List[Tuple[str, int]] = []
+        if dense_idx is not None:
+            groups.append(("dense", dense_idx))
+        if moe_idx is not None:
+            groups.append(("moe", moe_idx))
+        return groups or [("standard", 0)]
+
+    # --- Explicit per-layer type list (e.g. Qwen3.5/3.6 hybrid): the config
+    # carries a `layer_types` array naming each decoder layer's attention kind
+    # ("linear_attention" / "full_attention", interleaved every
+    # full_attention_interval). This family has NO first_k_dense_replace /
+    # decoder_sparse_step / mlp_only_layers (every layer is MoE), so the earlier
+    # branches don't fire; the UNIQUE axis here is the attention type. Pick the
+    # first occurrence of each distinct type, preserving order. This also makes
+    # the debug window reach the first full_attention layer, which is required
+    # for the hybrid KV-cache group indexing to build a full-attention group
+    # (a linear-only prefix trips _get_attention_group_id_for_hybrid). ---
+    layer_types = config.get("layer_types")
+    if isinstance(layer_types, list) and layer_types:
+        seen = set()
+        groups = []
+        for idx, ltype in enumerate(layer_types[:num_layers]):
+            if ltype not in seen:
+                seen.add(ltype)
+                groups.append((str(ltype), idx))
+        return groups or [("standard", 0)]
+
     # --- Sliding-window hybrid (e.g. Gemma): one full pattern cycle. ---
     # sliding_window_pattern like [5, 1] = 5 sliding + 1 full. Test the first
     # sliding layer and the first full layer (the two unique attention types).
@@ -74,6 +119,12 @@ def load_model_info(model_path: str) -> ModelInfo:
 
     with open(config_path) as f:
         config = json.load(f)
+
+    # Multimodal configs (e.g. Qwen3.5/3.6 VL/MoE) nest the language-model
+    # fields under "text_config". Merge them up so the loader (and the
+    # layer-group heuristics) can read them transparently.
+    if isinstance(config.get("text_config"), dict):
+        config = {**config, **config["text_config"]}
 
     # Required fields
     try:

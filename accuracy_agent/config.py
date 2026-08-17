@@ -17,8 +17,8 @@ class DebugConfig:
     # Remote hosts
     gpu_host: str = ""
     gpu_docker: str = ""
-    xpu_host: str = ""
-    xpu_docker: str = ""
+    dut_host: str = ""
+    dut_docker: str = ""
 
     # GPU vLLM configuration
     gpu_vllm_path: str = "/workspace/vllm"
@@ -26,11 +26,14 @@ class DebugConfig:
     gpu_cards: str = "0"
     gpu_ssh_key_path: Optional[str] = None
 
-    # XPU vLLM configuration
-    xpu_vllm_path: str = "/workspace/vllm"
-    xpu_user: str = "root"
-    xpu_cards: str = "0"
-    xpu_ssh_key_path: Optional[str] = None
+    # Device-under-test (DUT) vLLM configuration
+    dut_vllm_path: str = "/workspace/vllm"
+    dut_user: str = "root"
+    dut_cards: str = "0"
+    dut_ssh_key_path: Optional[str] = None
+    # Device type for the device-under-test slot: "cuda" (NVIDIA GPU),
+    # "xpu" (Intel GPU), or "hpu" (Gaudi).
+    dut_device_type: str = "xpu"
 
     # Test scope
     # layer_select: "auto" (default) tests one representative per UNIQUE layer
@@ -64,12 +67,13 @@ class DebugConfig:
             "gpu_cards": data.get("gpu", {}).get("cards", "0"),
             "gpu_ssh_key_path": data.get("gpu", {}).get("ssh_key_path"),
 
-            "xpu_host": data.get("xpu", {}).get("host", ""),
-            "xpu_user": data.get("xpu", {}).get("user", "root"),
-            "xpu_docker": data.get("xpu", {}).get("docker", ""),
-            "xpu_vllm_path": data.get("xpu", {}).get("vllm_path", "/workspace/vllm"),
-            "xpu_cards": data.get("xpu", {}).get("cards", "0"),
-            "xpu_ssh_key_path": data.get("xpu", {}).get("ssh_key_path"),
+            "dut_host": data.get("dut", {}).get("host", ""),
+            "dut_user": data.get("dut", {}).get("user", "root"),
+            "dut_docker": data.get("dut", {}).get("docker", ""),
+            "dut_vllm_path": data.get("dut", {}).get("vllm_path", "/workspace/vllm"),
+            "dut_cards": data.get("dut", {}).get("cards", "0"),
+            "dut_ssh_key_path": data.get("dut", {}).get("ssh_key_path"),
+            "dut_device_type": data.get("dut", {}).get("device_type", "xpu"),
 
             "shared_fs": data.get("shared_fs", "/mnt/weka"),
             "output_dir": data.get("output_dir", "/mnt/weka/accuracy_debug"),

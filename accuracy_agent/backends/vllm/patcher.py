@@ -1,5 +1,7 @@
 """Auto-patch vLLM source to enable layer extraction via SSH"""
 
+import os
+import sys
 import paramiko
 import subprocess
 import socket
@@ -7,10 +9,16 @@ import base64
 from pathlib import Path
 from typing import Optional, Callable
 import logging
-from .patches.models import ModelPatchProvider, GLMPatchProvider, GLM52PatchProvider
+from .patches.models import ModelPatchProvider, GLMPatchProvider, GLM52PatchProvider, Qwen3MoePatchProvider
 from .patches.models.base import ModelPatchProvider as BaseModelPatchProvider
 
 logger = logging.getLogger(__name__)
+
+# Local-exec timeout for a single `exec_in_docker` call. The model-load +
+# forward for a large FP8 MoE (dozens of shards) can exceed the old hard-coded
+# 300s, which would silently return a "timed out" stderr and abort the run.
+# Default to 30 min; override with ACCURACY_EXEC_TIMEOUT (seconds).
+_EXEC_TIMEOUT = int(os.environ.get("ACCURACY_EXEC_TIMEOUT", "1800"))
 
 
 class VLLMPatcher:
@@ -22,7 +30,8 @@ class VLLMPatcher:
         docker: str,
         vllm_path: str,
         user: str = "root",
-        model_name: Optional[str] = None
+        model_name: Optional[str] = None,
+        device_type: str = "xpu",
     ):
         """
         Initialize patcher
@@ -34,12 +43,19 @@ class VLLMPatcher:
             user: SSH username (default: "root")
             model_name: Model name for model-specific patches (e.g., "glm-5.2", "llama-3")
                        If None, uses generic patches
+            device_type: Device under test ("xpu", "hpu", or "cuda"). Gates the
+                       Intel-XPU-only kernel fixes: a vLLM wheel ships the XPU
+                       kernel files (scaled_mm/xpu.py, xpu_mla_sparse.py) on
+                       every platform, so a bare file-exists check would try to
+                       patch them on a Gaudi/CUDA run and log a spurious
+                       "Could not apply XPU ... fix" anchor warning.
         """
         self.host = host
         self.docker = docker
         self.vllm_path = vllm_path
         self.user = user
         self.model_name = model_name
+        self.device_type = device_type
         self.ssh_client: Optional[paramiko.SSHClient] = None
         self.patch_provider: Optional[BaseModelPatchProvider] = None
         self.is_local = self._detect_local()
@@ -75,6 +91,11 @@ class VLLMPatcher:
             else:
                 logger.info("Detected GLM model (generic)")
                 return GLMPatchProvider()
+
+        # Qwen models (Qwen3-MoE: Qwen3-*-A*B, Qwen3.5/3.6 MoE, etc.)
+        if 'qwen' in model_name_lower:
+            logger.info("Detected Qwen model (Qwen3-MoE)")
+            return Qwen3MoePatchProvider()
 
         # TODO: Add more model types here as needed
         # elif 'llama' in model_name_lower:
@@ -188,7 +209,7 @@ class VLLMPatcher:
             self.ssh_client = None
             logger.info(f"Disconnected from {self.host}")
 
-    def exec_in_docker(self, cmd: str) -> tuple[str, str]:
+    def exec_in_docker(self, cmd: str, stream: bool = False) -> tuple[str, str]:
         """
         Execute command in docker container (or locally if running inside it)
 
@@ -199,18 +220,53 @@ class VLLMPatcher:
             Tuple of (stdout, stderr) as strings
         """
         if self.is_local:
-            # Execute locally using subprocess
-            logger.debug(f"Executing locally: {cmd}")
+            # Only STREAM when the caller asks (stream=True) -- i.e. the single
+            # long-running vLLM run in run_layer_range, which otherwise hangs
+            # silently for minutes under capture_output. The many short internal
+            # ops that also go through here (cat/base64/test -f while patching)
+            # must stay QUIET; streaming them dumped whole source files and stray
+            # numbers to the console. Default stream=False restores that quiet
+            # capture; stream=True mirrors child stdout+stderr live to THIS
+            # process's stderr while still capturing the full text.
+            logger.debug(f"Executing locally (stream={stream}): {cmd}")
+            if not stream:
+                try:
+                    result = subprocess.run(
+                        ["bash", "-c", cmd],
+                        capture_output=True,
+                        text=True,
+                        timeout=_EXEC_TIMEOUT,
+                    )
+                    return result.stdout, result.stderr
+                except subprocess.TimeoutExpired:
+                    return "", f"Command timed out after {_EXEC_TIMEOUT}s"
+                except Exception as e:
+                    return "", f"Local execution failed: {e}"
             try:
-                result = subprocess.run(
+                proc = subprocess.Popen(
                     ["bash", "-c", cmd],
-                    capture_output=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,  # merge so ordering is preserved
                     text=True,
-                    timeout=300
+                    bufsize=1,  # line-buffered
                 )
-                return result.stdout, result.stderr
-            except subprocess.TimeoutExpired:
-                return "", "Command timed out after 300s"
+                captured = []
+                try:
+                    for line in proc.stdout:  # blocks per line until EOF
+                        captured.append(line)
+                        sys.stderr.write(line)
+                        sys.stderr.flush()
+                    proc.wait(timeout=_EXEC_TIMEOUT)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+                    return "".join(captured), f"Command timed out after {_EXEC_TIMEOUT}s"
+                out = "".join(captured)
+                # stderr was merged into stdout for live ordering; the caller's
+                # failure check scans BOTH streams for ERROR:/Traceback, so
+                # returning the merged text as stdout (stderr empty) is safe and
+                # loses no signal.
+                return out, ""
             except Exception as e:
                 return "", f"Local execution failed: {e}"
 
@@ -335,7 +391,12 @@ class VLLMPatcher:
                 f.write(patched_content)
         else:
             # Write via SSH when running remotely
-            temp_file = f"/tmp/vllm_patch_{Path(target_file).name}"
+            # Namespace the host temp file by SSH user: /tmp is world-writable
+            # with a sticky bit, so a fixed name left behind by ANOTHER user
+            # (e.g. a prior run as a different account) cannot be overwritten and
+            # fails with EACCES. Per-user names avoid the cross-user collision
+            # (a same-user re-run just overwrites its own file).
+            temp_file = f"/tmp/vllm_patch_{self.user}_{Path(target_file).name}"
 
             # Upload to host temp location via SFTP
             with self.ssh_client.open_sftp() as sftp:
@@ -400,7 +461,12 @@ class VLLMPatcher:
             with open(target_file, 'w') as f:
                 f.write(content)
         else:
-            temp_file = f"/tmp/vllm_patch_{Path(target_file).name}"
+            # Namespace the host temp file by SSH user: /tmp is world-writable
+            # with a sticky bit, so a fixed name left behind by ANOTHER user
+            # (e.g. a prior run as a different account) cannot be overwritten and
+            # fails with EACCES. Per-user names avoid the cross-user collision
+            # (a same-user re-run just overwrites its own file).
+            temp_file = f"/tmp/vllm_patch_{self.user}_{Path(target_file).name}"
             with self.ssh_client.open_sftp() as sftp:
                 with sftp.open(temp_file, 'w') as f:
                     f.write(content)
@@ -432,7 +498,9 @@ class VLLMPatcher:
             logger.info(f"Copied {local_path} -> {container_path} (local)")
         else:
             # Upload to host temp location via SFTP
-            temp_path = f"/tmp/{local_path.name}"
+            # Upload to host temp location via SFTP. Namespace by SSH user for
+            # the same /tmp sticky-bit cross-user collision reason as above.
+            temp_path = f"/tmp/{self.user}_{local_path.name}"
             with self.ssh_client.open_sftp() as sftp:
                 sftp.put(str(local_path), temp_path)
 
@@ -511,19 +579,27 @@ class VLLMPatcher:
         debug_runner_container = f"{self.vllm_path}/vllm/model_executor/debug_runner.py"
         self.copy_file_to_container(debug_runner_local, debug_runner_container)
 
-        # Apply XPU memory detection fix
-        self._apply_xpu_memory_fix()
-
-        # Apply architecture-agnostic layer-limiting fix (make_layers)
+        # Apply architecture-agnostic layer-limiting fix (make_layers) -- this is
+        # device-independent and needed on every backend.
         self._apply_make_layers_fix()
 
-        # Sync XPU sparse-MLA backend to the refactored shared MLA forward
-        # (no-op on non-XPU vLLM trees where the file is absent)
-        self._apply_sparse_mla_fix()
-
-        # Pad ragged-N FP8 block-scaled GEMM so oneDNN XPU matmul accepts it
-        # (no-op on non-XPU vLLM trees where the file is absent)
-        self._apply_fp8_gemm_fix()
+        # Intel-XPU-only kernel fixes. Gate on device_type: a vLLM wheel ships
+        # the XPU kernel files (scaled_mm/xpu.py, xpu_mla_sparse.py, mem_utils
+        # XPU branch) on Gaudi/CUDA too, so a bare file-exists check would try to
+        # patch them off-XPU and emit a misleading "Could not apply XPU ... fix"
+        # anchor warning on every Gaudi run. Only Intel XPU actually needs them.
+        if self.device_type == "xpu":
+            # XPU memory detection fix (torch.xpu.get_memory_info bug)
+            self._apply_xpu_memory_fix()
+            # Sync XPU sparse-MLA backend to the refactored shared MLA forward
+            self._apply_sparse_mla_fix()
+            # Pad ragged-N FP8 block-scaled GEMM so oneDNN XPU matmul accepts it
+            self._apply_fp8_gemm_fix()
+        else:
+            logger.info(
+                "Skipping Intel-XPU-only kernel fixes (device_type=%s)",
+                self.device_type,
+            )
 
         logger.info("All patches applied successfully")
 
@@ -912,11 +988,18 @@ if _aa_start is not None and _aa_end is not None:
         files_to_restore = [
             f"{self.vllm_path}/vllm/model_executor/model_loader/default_loader.py",
             f"{self.vllm_path}/vllm/model_executor/models/llama.py",
-            f"{self.vllm_path}/vllm/utils/mem_utils.py",
             f"{self.vllm_path}/vllm/model_executor/models/utils.py",
-            f"{self.vllm_path}/vllm/v1/attention/backends/mla/xpu_mla_sparse.py",
-            f"{self.vllm_path}/vllm/model_executor/kernels/linear/scaled_mm/xpu.py",
         ]
+
+        # Intel-XPU-only files: only patched when device_type == "xpu", so only
+        # restore them there (restore_original is a safe no-op without a backup,
+        # but gating keeps cleanup symmetric with apply_all_patches).
+        if self.device_type == "xpu":
+            files_to_restore += [
+                f"{self.vllm_path}/vllm/utils/mem_utils.py",
+                f"{self.vllm_path}/vllm/v1/attention/backends/mla/xpu_mla_sparse.py",
+                f"{self.vllm_path}/vllm/model_executor/kernels/linear/scaled_mm/xpu.py",
+            ]
 
         # Add model-specific file if using model-specific patches
         if self.patch_provider:

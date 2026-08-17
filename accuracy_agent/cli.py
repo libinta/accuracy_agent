@@ -39,10 +39,12 @@ def main(config, model, gpu_host, gpu_docker, xpu_host, xpu_docker, shared_fs, o
             debug_config.gpu_host = gpu_host
         if gpu_docker:
             debug_config.gpu_docker = gpu_docker
+        # CLI flags stay named --xpu-* (legacy, CLI-only path); they map onto the
+        # renamed device-under-test config fields.
         if xpu_host:
-            debug_config.xpu_host = xpu_host
+            debug_config.dut_host = xpu_host
         if xpu_docker:
-            debug_config.xpu_docker = xpu_docker
+            debug_config.dut_docker = xpu_docker
         if shared_fs != '/mnt/weka':  # Check if non-default
             debug_config.shared_fs = shared_fs
         if output_dir:
@@ -61,8 +63,8 @@ def main(config, model, gpu_host, gpu_docker, xpu_host, xpu_docker, shared_fs, o
             model_path=model,
             gpu_host=gpu_host,
             gpu_docker=gpu_docker,
-            xpu_host=xpu_host,
-            xpu_docker=xpu_docker,
+            dut_host=xpu_host,
+            dut_docker=xpu_docker,
             shared_fs=shared_fs,
             output_dir=output_dir or f"{shared_fs}/accuracy_debug_output",
             layer_start=layer_start if layer_start is not None else 0,
@@ -75,8 +77,12 @@ def main(config, model, gpu_host, gpu_docker, xpu_host, xpu_docker, shared_fs, o
     table.add_column("Value", style="white")
 
     table.add_row("Model", debug_config.model_path)
+    # Reference (peer) slot is always CUDA GPU; always show it.
     table.add_row("GPU", f"{debug_config.gpu_host} / {debug_config.gpu_docker}")
-    table.add_row("XPU", f"{debug_config.xpu_host} / {debug_config.xpu_docker}")
+    # Device-under-test slot: label by its real type (XPU for Intel GPU, HPU for
+    # Intel Gaudi), not a hardcoded "XPU" -- a Gaudi run sets xpu.device_type=hpu.
+    dut_label = (debug_config.dut_device_type or "xpu").upper()
+    table.add_row(dut_label, f"{debug_config.dut_host} / {debug_config.dut_docker}")
     table.add_row("Layers", f"{debug_config.layer_start}-{debug_config.layer_end}")
     table.add_row("Output", debug_config.output_dir)
 
@@ -110,7 +116,9 @@ def main(config, model, gpu_host, gpu_docker, xpu_host, xpu_docker, shared_fs, o
         console.print("="*60 + "\n")
 
         if getattr(result, "extracted_only", False):
-            console.print("[green]✓ XPU hidden states extracted (no GPU peer to compare)[/green]")
+            console.print(
+                f"[green]✓ {dut_label} hidden states extracted "
+                f"(no GPU peer to compare)[/green]")
         elif result.divergent_layer is not None:
             console.print(f"[red]✗ Divergence found in layer {result.divergent_layer}[/red]")
         else:

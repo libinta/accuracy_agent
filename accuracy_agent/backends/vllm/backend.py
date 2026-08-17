@@ -28,13 +28,26 @@ class VLLMBackend(Backend):
             shared_fs: Shared filesystem path for exchanging tensors
         """
         super().__init__(config, model_path, shared_fs)
+        # Model-type routing (VLLMPatcher._get_patch_provider) substring-matches
+        # on this name. The HF hub cache resolves a model to
+        # ".../models--Org--Model/snapshots/<commit-hash>", whose leaf dir name is
+        # a bare commit hash -- so Path(model_path).name would be a hash and route
+        # to the wrong (fallback) provider. Walk up to the "models--Org--Model"
+        # component so a snapshot path still carries the real model name.
         model_name = Path(model_path).name
+        _parts = Path(model_path).parts
+        if "snapshots" in _parts:
+            for _part in _parts:
+                if _part.startswith("models--"):
+                    model_name = _part
+                    break
         self.patcher = VLLMPatcher(
             host=config.host,
             docker=config.docker,
             vllm_path=config.vllm_path,
             user=config.user,
             model_name=model_name,
+            device_type=config.device_type,
         )
         self.is_patched = False
         self.memory_mode = None  # Will be set in setup()
@@ -125,15 +138,27 @@ class VLLMBackend(Backend):
             affinity_env = f"ZE_AFFINITY_MASK={cards} "
         elif self.config.device_type == "cuda":
             affinity_env = f"CUDA_VISIBLE_DEVICES={cards} "
+        elif self.config.device_type == "hpu":
+            # Gaudi (Habana) selects visible accelerators via module IDs.
+            affinity_env = f"HABANA_VISIBLE_MODULES={cards} "
         else:
             affinity_env = ""
 
         # Construct command to run debug_runner.py
         # Use shlex.quote for all paths and user-provided strings to prevent shell injection
+        #
+        # Resolve the interpreter INSIDE the target shell rather than hardcoding
+        # "python": some containers (e.g. the NVIDIA H200 image) ship only
+        # "python3" and have no "python" alias, which failed with
+        # "python: command not found". Prefer "python" (unchanged behavior on the
+        # XPU/Gaudi containers that have it) and fall back to "python3". The
+        # command substitution works both for the local `bash -c` path and the
+        # remote `docker exec ... bash -c` path.
+        py = "$(command -v python || command -v python3)"
         cmd = (
             f"cd {shlex.quote(self.config.vllm_path)} && "
             f"{affinity_env}"
-            f"python -m vllm.model_executor.debug_runner "
+            f"{py} -m vllm.model_executor.debug_runner "
             f"--model-path {shlex.quote(self.model_path)} "
             f"--layer-start {layer_start} "
             f"--layer-end {layer_end} "
@@ -148,11 +173,43 @@ class VLLMBackend(Backend):
         logger.debug(f"Command: {cmd}")
 
         # Execute in docker
-        stdout, stderr = self.patcher.exec_in_docker(cmd)
+        # stream=True: this is the long-running vLLM engine run; mirror its
+        # output live so shard-load %, HPU compile/warmup and forward progress
+        # are visible instead of a multi-minute silent hang. All the short
+        # patch-time file ops use the default (quiet) exec_in_docker.
+        stdout, stderr = self.patcher.exec_in_docker(cmd, stream=True)
 
-        # Check for errors (case-insensitive)
-        if stderr and "error" in stderr.lower():
-            raise RuntimeError(f"vLLM execution failed: {stderr}")
+        # Dump the debug_runner subprocess output to a file so its prints
+        # (enforce_eager value, compile/graph signals, capture diagnostics) are
+        # inspectable -- exec_in_docker captures them, so they never reach the
+        # parent CLI log otherwise. Best-effort; keyed by device+layer window.
+        # Written to the current working directory (where the CLI is launched)
+        # so it lands next to the run instead of at the shared_fs root.
+        try:
+            _dbg = (
+                Path.cwd()
+                / f"debugrunner_{self.config.device_type}_{layer_start}_{layer_end}.log"
+            )
+            _dbg.write_text(
+                f"$ {cmd}\n\n===== STDOUT =====\n{stdout}\n\n===== STDERR =====\n{stderr}\n"
+            )
+        except Exception:
+            pass
+
+        # Only treat EXPLICIT failure signals as fatal here. A bare
+        # "error" substring is too broad: HPU emits benign warnings
+        # ("... does not have any effect"), vLLM logs can say "0 errors", and
+        # the FP8-GEMM/sparse-MLA fixes intentionally log "Could not apply ...".
+        # debug_runner.main() prints an "ERROR:" line + a traceback on real
+        # failure, so key off those. Final success is still gated on the output
+        # file existing below (so a missed signal cannot pass silently).
+        # Local runs now STREAM output: exec_in_docker merges child stdout+stderr
+        # and returns it as stdout (stderr empty), so scan BOTH streams for the
+        # failure signals. Remote (SSH) runs still split the two, so the union
+        # covers both transports.
+        combined = f"{stdout}\n{stderr}"
+        if "ERROR:" in combined or "Traceback (most recent call last)" in combined:
+            raise RuntimeError(f"vLLM execution failed:\n{combined}")
 
         # A remote backend wrote output_path onto ITS filesystem, which the two
         # containers generally do not share. Pull it (and the per-layer
