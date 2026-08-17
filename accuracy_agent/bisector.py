@@ -174,8 +174,13 @@ class Bisector:
             hidden_states_gpu = gpu_future.result()
             hidden_states_dut = dut_future.result()
 
-        # Compare tensors
-        result = compare_tensors(hidden_states_gpu, hidden_states_dut)
+        # Compare tensors using the configured (bf16-realistic) thresholds.
+        result = compare_tensors(
+            hidden_states_gpu,
+            hidden_states_dut,
+            rel_threshold=self.config.rel_threshold,
+            cos_threshold=self.config.cos_threshold,
+        )
 
         return result
 
@@ -468,6 +473,12 @@ class Bisector:
         # layer range yields a distinct, isolatable output for bisection.
         gpu_tensor = _extract_compare_tensor(gpu_data)
         dut_tensor = _extract_compare_tensor(dut_data)
-        comparison = compare_tensors(gpu_tensor, dut_tensor)
+
+        comparison = compare_tensors(
+            gpu_tensor,
+            dut_tensor,
+            rel_threshold=self.config.rel_threshold,
+            cos_threshold=self.config.cos_threshold,
+        )
 
         return comparison

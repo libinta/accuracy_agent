@@ -45,6 +45,17 @@ class DebugConfig:
     layer_end: int = 3
     test_prompt: str = "What is the capital of France?"
 
+    # Comparison thresholds (a hidden-state MATCH needs cos >= cos_threshold AND
+    # max rel error <= rel_threshold). bf16 cross-hardware hidden states differ
+    # by ~1e-2 rel error / ~1e-4 cos distance even when numerically equivalent,
+    # so the comparator's strict library defaults (rel 1e-4, cos 0.999) flag a
+    # true MATCH as DIVERGE and trigger needless per-layer bisection -- which
+    # crashes on HPU hybrid sub-windows that lack a full-attention layer. These
+    # bf16-realistic defaults are overridable via test.cos_threshold /
+    # test.rel_threshold in the yaml.
+    cos_threshold: float = 0.99
+    rel_threshold: float = 5e-2
+
     # SSH settings
     ssh_user: Optional[str] = None  # Default to current user
     ssh_key_path: Optional[str] = None  # Default to ~/.ssh/id_rsa
@@ -82,6 +93,8 @@ class DebugConfig:
             "layer_start": data.get("test", {}).get("layer_start", 0),
             "layer_end": data.get("test", {}).get("layer_end", 3),
             "test_prompt": data.get("test", {}).get("prompt", "What is the capital of France?"),
+            "cos_threshold": data.get("test", {}).get("cos_threshold", 0.99),
+            "rel_threshold": data.get("test", {}).get("rel_threshold", 5e-2),
 
             "ssh_user": data.get("ssh_user"),
             "ssh_key_path": data.get("ssh_key_path"),
