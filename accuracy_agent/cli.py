@@ -143,6 +143,13 @@ def main(config, model, gpu_host, gpu_docker, xpu_host, xpu_docker, shared_fs, o
                 if result.tested_layers and i < len(result.tested_layers):
                     name, idx = result.tested_layers[i]
                     layer_label = f"Layer {idx} ({name})"
+                elif (len(result.comparison_results) == 1
+                      and debug_config.layer_end - debug_config.layer_start > 1):
+                    # Whole-window match: bisection never split into per-layer
+                    # results (the window compared equal), so this single row is
+                    # the range [start, end), NOT layer 0.
+                    layer_label = (f"Layers {debug_config.layer_start}-"
+                                   f"{debug_config.layer_end}")
                 else:
                     layer_label = f"Layer {debug_config.layer_start + i}"
 
