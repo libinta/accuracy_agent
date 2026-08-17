@@ -391,7 +391,12 @@ class VLLMPatcher:
                 f.write(patched_content)
         else:
             # Write via SSH when running remotely
-            temp_file = f"/tmp/vllm_patch_{Path(target_file).name}"
+            # Namespace the host temp file by SSH user: /tmp is world-writable
+            # with a sticky bit, so a fixed name left behind by ANOTHER user
+            # (e.g. a prior run as a different account) cannot be overwritten and
+            # fails with EACCES. Per-user names avoid the cross-user collision
+            # (a same-user re-run just overwrites its own file).
+            temp_file = f"/tmp/vllm_patch_{self.user}_{Path(target_file).name}"
 
             # Upload to host temp location via SFTP
             with self.ssh_client.open_sftp() as sftp:
@@ -456,7 +461,12 @@ class VLLMPatcher:
             with open(target_file, 'w') as f:
                 f.write(content)
         else:
-            temp_file = f"/tmp/vllm_patch_{Path(target_file).name}"
+            # Namespace the host temp file by SSH user: /tmp is world-writable
+            # with a sticky bit, so a fixed name left behind by ANOTHER user
+            # (e.g. a prior run as a different account) cannot be overwritten and
+            # fails with EACCES. Per-user names avoid the cross-user collision
+            # (a same-user re-run just overwrites its own file).
+            temp_file = f"/tmp/vllm_patch_{self.user}_{Path(target_file).name}"
             with self.ssh_client.open_sftp() as sftp:
                 with sftp.open(temp_file, 'w') as f:
                     f.write(content)
@@ -488,7 +498,9 @@ class VLLMPatcher:
             logger.info(f"Copied {local_path} -> {container_path} (local)")
         else:
             # Upload to host temp location via SFTP
-            temp_path = f"/tmp/{local_path.name}"
+            # Upload to host temp location via SFTP. Namespace by SSH user for
+            # the same /tmp sticky-bit cross-user collision reason as above.
+            temp_path = f"/tmp/{self.user}_{local_path.name}"
             with self.ssh_client.open_sftp() as sftp:
                 sftp.put(str(local_path), temp_path)
 
