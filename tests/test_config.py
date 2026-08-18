@@ -94,3 +94,111 @@ test:
     assert config.gpu_vllm_path == "/workspace/vllm"
     assert config.xpu_vllm_path == "/workspace/vllm"
     assert config.test_prompt == "Test prompt"
+
+
+def test_debug_config_gpu_image_defaults():
+    """GPU docker automation is on by default, with nothing else preset."""
+    config = DebugConfig(
+        backend="vllm",
+        model_path="/mnt/weka/model",
+        shared_fs="/mnt/weka",
+        output_dir="/mnt/weka/output",
+        xpu_host="localhost",
+        xpu_docker="xpu_container",
+    )
+    assert config.gpu_auto_image is True
+    assert config.gpu_image == ""
+    assert config.gpu_docker == ""
+    assert config.gpu_inside_container is None
+
+
+def test_debug_config_from_yaml_gpu_image_fields(tmp_path):
+    """gpu.image / auto_image / container_name / docker_run_args round-trip"""
+    yaml_content = """backend: vllm
+
+model:
+  path: /mnt/weka/model
+
+gpu:
+  image: vllm/vllm-openai:v0.11.0
+  auto_image: false
+  container_name: my_gpu_container
+  docker_run_args: "--network=host"
+  cards: "0"
+
+xpu:
+  host: localhost
+  docker: xpu_container
+  inside_container: true
+
+shared_fs: /mnt/weka
+output_dir: /mnt/weka/accuracy_debug_output
+"""
+
+    yaml_file = tmp_path / "auto_gpu_config.yaml"
+    yaml_file.write_text(yaml_content)
+
+    config = DebugConfig.from_yaml(str(yaml_file))
+
+    assert config.gpu_image == "vllm/vllm-openai:v0.11.0"
+    assert config.gpu_auto_image is False
+    assert config.gpu_container_name == "my_gpu_container"
+    assert config.gpu_docker_run_args == "--network=host"
+    assert config.xpu_inside_container is True
+    assert config.gpu_inside_container is None  # not specified -> auto-detect
+
+
+def test_debug_config_vllm_commit_defaults():
+    """Building peers from a commit is opt-in, and off by default."""
+    config = DebugConfig(model_path="/mnt/weka/model")
+
+    assert config.vllm_commit == ""
+    assert config.vllm_repo_path == ""
+    assert config.vllm_build_root == ""
+    assert config.vllm_build_kernels is False
+    assert config.vllm_build_rebuild is False
+    assert config.gpu_base_image == ""
+    assert config.xpu_base_image == ""
+    assert config.xpu_image == ""
+
+
+def test_debug_config_from_yaml_vllm_commit_fields(tmp_path):
+    yaml_content = """
+backend: vllm
+
+model:
+  path: /mnt/weka/model
+
+vllm:
+  commit: 7794b1e08bf505ff28664515ffaaeeec955ab796
+  repo_path: /home/me/vllm
+  build_root: /mnt/weka/accuracy_agent_builds
+  build_kernels: true
+  rebuild: true
+
+gpu:
+  base_image: nvcr.io/nvidia/pytorch:26.07-py3
+
+xpu:
+  base_image: intel/intel-extension-for-pytorch:2.8.10-xpu
+  container_name: my_xpu_peer
+  docker_run_args: "--group-add 110"
+
+shared_fs: /mnt/weka
+output_dir: /mnt/weka/accuracy_debug_output
+"""
+
+    yaml_file = tmp_path / "commit_config.yaml"
+    yaml_file.write_text(yaml_content)
+
+    config = DebugConfig.from_yaml(str(yaml_file))
+
+    assert config.vllm_commit == "7794b1e08bf505ff28664515ffaaeeec955ab796"
+    assert config.vllm_repo_path == "/home/me/vllm"
+    assert config.vllm_build_root == "/mnt/weka/accuracy_agent_builds"
+    assert config.vllm_build_kernels is True
+    assert config.vllm_build_rebuild is True
+    assert config.gpu_base_image == "nvcr.io/nvidia/pytorch:26.07-py3"
+    assert config.xpu_base_image == "intel/intel-extension-for-pytorch:2.8.10-xpu"
+    assert config.xpu_container_name == "my_xpu_peer"
+    assert config.xpu_docker_run_args == "--group-add 110"

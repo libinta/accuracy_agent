@@ -1,0 +1,63 @@
+# GPU/XPU accuracy testing with the GPU side configured automatically.
+#
+# There is no `gpu:` section at all: because the XPU docker runs on this machine,
+# the tool asks that container which vLLM COMMIT it is running, then installs
+# exactly that commit into the NVIDIA PyTorch image (nvcr.io/nvidia/pytorch) and
+# uses the result as the GPU peer -- so both sides run the same vLLM code and a
+# divergence cannot be blamed on a version difference.
+#
+#   $ python3 -m accuracy_agent.cli --config examples/local_xpu_auto_gpu.yaml
+#   Reading the vLLM commit out of the XPU docker and building a matching CUDA peer...
+#   ✓ XPU container runs vLLM @ 7794b1e08bf505ff28664515ffaaeeec955ab796 \
+#     [git checkout /workspace/vllm]
+#   ✓ cuda: vLLM @ 7794b1e08bf5 built on nvcr.io/nvidia/pytorch:26.07-py3 \
+#     (kernels from nearest nightly wheel, not this commit) \
+#     -> accuracy_agent_vllm_cuda_7794b1e08bf5
+#
+# The commit is resolved in a local vllm-project/vllm clone (~/vllm by default,
+# `vllm.repo_path` to point elsewhere) and fetched from origin if the clone does
+# not have it. CUDA kernels come from the nearest nightly wheel by default, which
+# takes minutes; add `--build-kernels` (1-2 h) when the commit touches C++/CUDA.
+# The built image is cached, so later runs with the same commit start in seconds.
+#
+# Requirements: a docker CLI and an NVIDIA GPU on this machine (otherwise the
+# automation stays out of the way and the run falls back to XPU-only
+# extraction), and the shared filesystem below available to both containers.
+#
+# Opt out with `gpu.auto_image: false` or `--no-auto-gpu-image`.
+
+backend: vllm
+
+model:
+  path: /mnt/weka/data/customer-models/GLM-5.2-FP8
+
+xpu:
+  host: localhost          # local: required for the GPU side to be auto-derived
+  docker: your_xpu_container
+  cards: "0"
+  device_type: xpu
+  vllm_path: /workspace/vllm
+  user: root
+
+# The GPU section can be omitted entirely. Add it only to override what the
+# automation picks, e.g.:
+# gpu:
+#   cards: "0"                       # which GPU(s) to run on (default "0")
+#   base_image: nvcr.io/nvidia/pytorch:26.07-py3  # pin the base the peer is built on
+#   image: my-registry/vllm:my-build # ready-made image: no detection, no build
+#   auto_image: false                # disable the automation completely
+
+# Where the detected commit is checked out and how it is built. All optional.
+# vllm:
+#   repo_path: /home/youruser/vllm         # clone to resolve the commit in
+#   build_root: /mnt/weka/accuracy_agent_builds
+#   build_kernels: false                   # true = compile CUDA kernels (1-2 h)
+#   rebuild: false                         # ignore the cached built image
+
+shared_fs: /mnt/weka                 # bind-mounted into the auto-launched container
+output_dir: /mnt/weka/accuracy_debug_auto_gpu
+
+test:
+  layer_start: 0
+  layer_end: 3
+  prompt: "What is the capital of France?"

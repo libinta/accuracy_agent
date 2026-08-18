@@ -22,18 +22,26 @@ class VLLMPatcher:
         docker: str,
         vllm_path: str,
         user: str = "root",
-        model_name: Optional[str] = None
+        model_name: Optional[str] = None,
+        inside_container: Optional[bool] = None
     ):
         """
         Initialize patcher
 
         Args:
-            host: SSH host (e.g., "gpu-host.example.com")
+            host: SSH host (e.g., "gpu-host.example.com"). Empty/localhost means
+                  the docker daemon runs on this machine, so the docker CLI is
+                  used directly instead of SSH.
             docker: Docker container name (e.g., "your_gpu_container")
             vllm_path: Path to vLLM inside docker (e.g., "/workspace/vllm")
             user: SSH username (default: "root")
             model_name: Model name for model-specific patches (e.g., "glm-5.2", "llama-3")
                        If None, uses generic patches
+            inside_container: Override for "are we running inside `docker`?".
+                  None (default) auto-detects. Pass False for a container we know
+                  is a separate one -- e.g. an auto-launched GPU container whose
+                  vllm_path (site-packages) may coincidentally exist here too,
+                  which would otherwise be mis-detected as local execution.
         """
         self.host = host
         self.docker = docker
@@ -42,7 +50,10 @@ class VLLMPatcher:
         self.model_name = model_name
         self.ssh_client: Optional[paramiko.SSHClient] = None
         self.patch_provider: Optional[BaseModelPatchProvider] = None
-        self.is_local = self._detect_local()
+        self.is_local = self._detect_local() if inside_container is None else inside_container
+        # Third mode besides "inside the container" and "SSH to another host":
+        # the container is on THIS machine, reached with a local `docker exec`.
+        self.use_local_docker = not self.is_local and self._is_local_host()
 
         # Initialize model-specific patch provider if model_name is given
         if model_name:
@@ -53,6 +64,8 @@ class VLLMPatcher:
 
         if self.is_local:
             logger.info(f"Detected local execution inside docker container {self.docker}")
+        elif self.use_local_docker:
+            logger.info(f"Using the local docker CLI to reach container {self.docker}")
 
     @staticmethod
     def _get_patch_provider(model_name: str) -> BaseModelPatchProvider:
@@ -88,6 +101,12 @@ class VLLMPatcher:
             "(most models use Llama-style layer structure)"
         )
         return GLMPatchProvider()
+
+    def _is_local_host(self) -> bool:
+        """True if `host` names this machine (so the docker CLI is reachable)."""
+        from accuracy_agent.docker_probe import is_local_host
+
+        return is_local_host(self.host)
 
     def _detect_local(self) -> bool:
         """
@@ -141,6 +160,10 @@ class VLLMPatcher:
             logger.info(f"Running locally inside {self.docker}, skipping SSH connection")
             return
 
+        if self.use_local_docker:
+            logger.info(f"{self.docker} is on this machine, skipping SSH connection")
+            return
+
         self.ssh_client = paramiko.SSHClient()
         self.ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
@@ -172,6 +195,10 @@ class VLLMPatcher:
             logger.info(f"Running locally inside {self.docker}, skipping SSH connection")
             return
 
+        if self.use_local_docker:
+            logger.info(f"{self.docker} is on this machine, skipping SSH connection")
+            return
+
         self.ssh_client = paramiko.SSHClient()
         self.ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         self.ssh_client.connect(self.host, username=self.user, password=password)
@@ -200,19 +227,12 @@ class VLLMPatcher:
         """
         if self.is_local:
             # Execute locally using subprocess
-            logger.debug(f"Executing locally: {cmd}")
-            try:
-                result = subprocess.run(
-                    ["bash", "-c", cmd],
-                    capture_output=True,
-                    text=True,
-                    timeout=300
-                )
-                return result.stdout, result.stderr
-            except subprocess.TimeoutExpired:
-                return "", "Command timed out after 300s"
-            except Exception as e:
-                return "", f"Local execution failed: {e}"
+            return self._run_local(cmd)
+
+        if self.use_local_docker:
+            # Container is on this machine: docker exec without SSH.
+            cmd_escaped = cmd.replace('"', '\\"')
+            return self._run_local(f'docker exec {self.docker} bash -c "{cmd_escaped}"')
 
         if not self.ssh_client:
             raise RuntimeError("Not connected - call connect() first")
@@ -228,6 +248,58 @@ class VLLMPatcher:
         stderr_str = stderr.read().decode()
 
         return stdout_str, stderr_str
+
+    def _run_local(self, cmd: str, timeout: int = 300) -> tuple[str, str]:
+        """Run a command on this machine, returning (stdout, stderr)."""
+        logger.debug(f"Executing locally: {cmd}")
+        try:
+            result = subprocess.run(
+                ["bash", "-c", cmd],
+                capture_output=True,
+                text=True,
+                timeout=timeout
+            )
+            return result.stdout, result.stderr
+        except subprocess.TimeoutExpired:
+            return "", f"Command timed out after {timeout}s"
+        except Exception as e:
+            return "", f"Local execution failed: {e}"
+
+    def _write_file_into_container(self, target_file: str, content: str) -> None:
+        """Write `content` to `target_file` inside the container.
+
+        Three transports, matching the three connection modes: a direct write
+        when we ARE the container, a local `docker cp` when the container is on
+        this machine, and SFTP-then-`docker cp` when it is on a remote host.
+        """
+        if self.is_local:
+            with open(target_file, 'w') as f:
+                f.write(content)
+            return
+
+        temp_file = f"/tmp/vllm_patch_{Path(target_file).name}"
+
+        if self.use_local_docker:
+            with open(temp_file, 'w') as f:
+                f.write(content)
+            _out, err = self._run_local(
+                f"docker cp {temp_file} {self.docker}:{target_file}"
+            )
+            if err.strip():
+                raise RuntimeError(f"Failed to copy patched file into container: {err}")
+            return
+
+        # Upload to host temp location via SFTP, then into the container.
+        with self.ssh_client.open_sftp() as sftp:
+            with sftp.open(temp_file, 'w') as f:
+                f.write(content)
+
+        docker_cp_cmd = f"docker cp {temp_file} {self.docker}:{target_file}"
+        stdin, stdout, stderr = self.ssh_client.exec_command(docker_cp_cmd)
+
+        stderr_str = stderr.read().decode()
+        if stderr_str:
+            raise RuntimeError(f"Failed to copy patched file into container: {stderr_str}")
 
     def backup_file(self, filepath: str) -> None:
         """
@@ -329,26 +401,7 @@ class VLLMPatcher:
             patched_content = "".join(patched_lines)
 
         # Write patched content
-        if self.is_local:
-            # Write directly to file system when running locally
-            with open(target_file, 'w') as f:
-                f.write(patched_content)
-        else:
-            # Write via SSH when running remotely
-            temp_file = f"/tmp/vllm_patch_{Path(target_file).name}"
-
-            # Upload to host temp location via SFTP
-            with self.ssh_client.open_sftp() as sftp:
-                with sftp.open(temp_file, 'w') as f:
-                    f.write(patched_content)
-
-            # Copy from host into docker container using docker cp
-            docker_cp_cmd = f"docker cp {temp_file} {self.docker}:{target_file}"
-            stdin, stdout, stderr = self.ssh_client.exec_command(docker_cp_cmd)
-
-            stderr_str = stderr.read().decode()
-            if stderr_str:
-                raise RuntimeError(f"Failed to copy patched file into container: {stderr_str}")
+        self._write_file_into_container(target_file, patched_content)
 
         logger.info(f"Applied patch to {target_file}")
 
@@ -396,19 +449,7 @@ class VLLMPatcher:
         if applied == 0:
             return 0
 
-        if self.is_local:
-            with open(target_file, 'w') as f:
-                f.write(content)
-        else:
-            temp_file = f"/tmp/vllm_patch_{Path(target_file).name}"
-            with self.ssh_client.open_sftp() as sftp:
-                with sftp.open(temp_file, 'w') as f:
-                    f.write(content)
-            docker_cp_cmd = f"docker cp {temp_file} {self.docker}:{target_file}"
-            stdin, stdout, stderr = self.ssh_client.exec_command(docker_cp_cmd)
-            stderr_str = stderr.read().decode()
-            if stderr_str:
-                raise RuntimeError(f"Failed to copy patched file into container: {stderr_str}")
+        self._write_file_into_container(target_file, content)
 
         logger.info(f"Applied {applied} replacement(s) to {target_file}")
         return applied
@@ -430,6 +471,15 @@ class VLLMPatcher:
             self.exec_in_docker(f"mkdir -p {Path(container_path).parent}")
             shutil.copy2(str(local_path), container_path)
             logger.info(f"Copied {local_path} -> {container_path} (local)")
+        elif self.use_local_docker:
+            # Container is on this machine: docker cp straight from here.
+            self.exec_in_docker(f"mkdir -p {Path(container_path).parent}")
+            _out, err = self._run_local(
+                f"docker cp {local_path} {self.docker}:{container_path}"
+            )
+            if err.strip():
+                raise RuntimeError(f"Failed to copy file into container: {err}")
+            logger.info(f"Copied {local_path} -> {self.docker}:{container_path}")
         else:
             # Upload to host temp location via SFTP
             temp_path = f"/tmp/{local_path.name}"

@@ -2,7 +2,7 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
     import torch
@@ -18,6 +18,9 @@ class BackendConfig:
     device_type: str
     user: str = "root"
     ssh_key_path: str = None
+    # None = auto-detect whether this process runs inside `docker`. Set False for
+    # a container known to be separate (e.g. an auto-launched GPU container).
+    inside_container: Optional[bool] = None
 
 
 class Backend(ABC):
