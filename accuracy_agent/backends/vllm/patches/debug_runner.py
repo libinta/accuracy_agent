@@ -221,6 +221,17 @@ def run_partial_layers(
     # model_executor.driver_worker.model_runner.model for manual layer forward.
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
 
+    # CPU offload + the MoE router's @torch.compile grouped_topk() are
+    # INCOMPATIBLE on XPU: offloaded gating weights are UVA host pointers and the
+    # XPU Triton path rejects them ("Pointer argument doesn't reference XPU device
+    # memory"). vLLM's enforce_eager does NOT disable a model's own @torch.compile
+    # decorator, so force Dynamo off whenever offloading (matches the serve
+    # config's TORCH_COMPILE_DISABLE=1 + TORCHDYNAMO_DISABLE=1). Set before the
+    # vLLM import so the model module's decorators see it.
+    if float(os.environ.get("ACCURACY_CPU_OFFLOAD_GB", "0")) > 0:
+        os.environ.setdefault("TORCH_COMPILE_DISABLE", "1")
+        os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
+
     # Import vLLM after setting environment
     from vllm import LLM
     from transformers import AutoTokenizer
@@ -258,12 +269,27 @@ def run_partial_layers(
     # and/or shrink max_model_len (smaller profiling peak + KV requirement).
     #   ACCURACY_GPU_MEM_UTIL  (default 0.90)
     #   ACCURACY_MAX_MODEL_LEN (default 1024)
+    # CPU-OFFLOAD knobs let the window build DEEP (up to the full model): the
+    # bulk of int4 expert weights live in host RAM and stream to the device per
+    # layer, so [0, layer_end) is no longer bounded by device VRAM. Mirrors the
+    # production Kimi serve config. Only passed when opted in so the resident
+    # (no-offload) path is unchanged.
+    #   ACCURACY_CPU_OFFLOAD_GB        e.g. 90   (per-worker host offload budget)
+    #   ACCURACY_CPU_OFFLOAD_PARAMS    e.g. experts  (offload only expert weights)
+    #   ACCURACY_KV_CACHE_MEMORY_BYTES e.g. 1073741824 (1GiB; pins KV size to
+    #        dodge vLLM's negative auto-KV under heavy offload)
     gpu_mem_util = float(os.environ.get("ACCURACY_GPU_MEM_UTIL", "0.90"))
     max_model_len = int(os.environ.get("ACCURACY_MAX_MODEL_LEN", "1024"))
-    print(f"Loading model from {model_path} with mode={load_mode}, "
-          f"tensor_parallel_size={num_cards}, gpu_mem_util={gpu_mem_util}, "
-          f"max_model_len={max_model_len}")
-    llm = LLM(
+    cpu_offload_gb = float(os.environ.get("ACCURACY_CPU_OFFLOAD_GB", "0"))
+    cpu_offload_params = os.environ.get("ACCURACY_CPU_OFFLOAD_PARAMS")
+    kv_cache_memory_bytes = os.environ.get("ACCURACY_KV_CACHE_MEMORY_BYTES")
+    # Force a specific fused-MoE kernel (default "auto" -> the platform oracle,
+    # which on XPU picks the native XPUExpertsWNA16). Set ACCURACY_MOE_BACKEND=
+    # "triton" to force the Triton WNA16 kernel instead (the oracle forces the
+    # requested backend, bypassing the XPU-only priority list).
+    moe_backend = os.environ.get("ACCURACY_MOE_BACKEND")
+
+    llm_kwargs = dict(
         model=model_path,
         trust_remote_code=True,
         enforce_eager=True,
@@ -273,6 +299,22 @@ def run_partial_layers(
         max_num_seqs=1,  # Single-seq profiling → smaller dummy-run peak
         disable_custom_all_reduce=True,  # Avoid multiprocess worker init issues
     )
+    if cpu_offload_gb > 0:
+        llm_kwargs["cpu_offload_gb"] = cpu_offload_gb
+    if cpu_offload_params:
+        llm_kwargs["cpu_offload_params"] = cpu_offload_params
+    if kv_cache_memory_bytes:
+        llm_kwargs["kv_cache_memory_bytes"] = int(kv_cache_memory_bytes)
+    if moe_backend:
+        llm_kwargs["moe_backend"] = moe_backend
+
+    print(f"Loading model from {model_path} with mode={load_mode}, "
+          f"tensor_parallel_size={num_cards}, gpu_mem_util={gpu_mem_util}, "
+          f"max_model_len={max_model_len}, cpu_offload_gb={cpu_offload_gb}, "
+          f"cpu_offload_params={cpu_offload_params}, "
+          f"kv_cache_memory_bytes={kv_cache_memory_bytes}, "
+          f"moe_backend={moe_backend or 'auto'}")
+    llm = LLM(**llm_kwargs)
 
     # Tokenize input
     input_ids = tokenizer.encode(prompt, return_tensors="pt")
